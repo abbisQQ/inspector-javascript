@@ -554,6 +554,56 @@ def fetch_url(url, headers=None, timeout=15, max_bytes=None):
         return None, ""
 
 
+def _random_probe_path() -> str:
+    """A path that almost certainly doesn't exist, for soft-404 baselining."""
+    return "/" + hashlib.sha1(os.urandom(16)).hexdigest()[:24] + "/jspect-probe-404"
+
+
+def soft404_signatures(probe_fn, base_url: str, n: int = 3) -> set:
+    """Learn how the server answers a path that does NOT exist.
+
+    Many SPAs / catch-all routers reply 200 with the same index.html for every
+    unknown path, so a bare status code can't tell a real hit from a miss. We
+    probe a few random paths and, if the replies agree on a 2xx/3xx signature,
+    return that signature set. An empty set means the server returns honest 404s
+    and no soft-404 filtering is needed.
+
+    `probe_fn(url)` must return a dict with at least `status`, `size`,
+    `content_type` (the same shape `check()` produces below).
+    """
+    sigs = []
+    for _ in range(n):
+        r = probe_fn(base_url.rstrip("/") + _random_probe_path())
+        sigs.append((r.get("status"), r.get("size"), r.get("content_type")))
+    from collections import Counter
+    sig, count = Counter(sigs).most_common(1)[0]
+    status = sig[0]
+    # Need agreement across probes AND a "looks like success" status — an honest
+    # 404/410 is not a catch-all and must never be filtered out.
+    if count >= max(2, n - 1) and status is not None and 200 <= status < 400:
+        return {sig}
+    return set()
+
+
+def is_soft404(result: dict, signatures: set, size_tolerance: int = 96) -> bool:
+    """True if `result` matches a learned catch-all signature (so it's a miss
+    dressed up as a hit). Size is matched with a small tolerance because a
+    reflected path can change the body length by a few bytes."""
+    if not signatures:
+        return False
+    status, size, ct = result.get("status"), result.get("size"), result.get("content_type")
+    if status is None or not (200 <= status < 400):
+        return False
+    for sig_status, sig_size, sig_ct in signatures:
+        if status != sig_status or ct != sig_ct:
+            continue
+        if size is None or sig_size is None:
+            return size == sig_size
+        if abs(size - sig_size) <= size_tolerance:
+            return True
+    return False
+
+
 def count_nonempty_lines(path):
     """Count non-empty lines in a file. Returns 0 on any error."""
     if not path or not Path(path).exists():
@@ -2677,12 +2727,19 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
     target_host = target_parsed.hostname or ""
     target_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
 
-    # Build absolute URL set from JSluice endpoints
+    # Build absolute URL set from JSluice endpoints. Carry the recorded method
+    # so we can probe method-aware, and set aside templated URLs (unresolved
+    # ${...} → "EXPR") — probing "/assetsEXPR" literally is pure noise.
     endpoints = parse_jsonl(endpoints_file)
-    urls = set()
+    url_methods = {}          # full_url -> set of recorded methods
+    parameterized = []        # [{url, method}] — templated, can't be probed as-is
     for e in endpoints:
         url = (e.get("url") or "").strip()
         if not url or not is_in_scope(url, target_host):
+            continue
+        method = (e.get("method") or "").strip().upper() or "GET"
+        if "EXPR" in url:
+            parameterized.append({"url": url, "method": method})
             continue
         # Build absolute URL
         if url.startswith(("http://", "https://")):
@@ -2694,7 +2751,18 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
         else:
             full = target_base + "/" + url
         full = full.split("#")[0]  # drop fragment
-        urls.add(full)
+        url_methods.setdefault(full, set()).add(method)
+    urls = set(url_methods)
+
+    # De-duplicated list of parameterized endpoints for the report / manual work.
+    if parameterized:
+        seen_p = set()
+        uniq_p = [p for p in parameterized
+                  if (p["url"], p["method"]) not in seen_p and not seen_p.add((p["url"], p["method"]))]
+        (output_dir / "parameterized-endpoints.json").write_text(
+            "\n".join(json.dumps(p) for p in uniq_p), encoding="utf-8")
+        Log.info(f"    {C.DIM}↳ {len(uniq_p)} templated endpoint(s) with ${{...}} params set aside "
+                 f"(see parameterized-endpoints.json) — need real values to probe{C.RESET}")
 
     if not urls:
         Log.info("    [-] No in-scope URLs to validate")
@@ -2729,12 +2797,6 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
         url_list = url_list[:MAX_ENDPOINTS_TO_VALIDATE]
         truncated = True
     # Persist the truncation marker so the report can surface it.
-    (output_dir / "live-endpoints-meta.json").write_text(json.dumps({
-        "total_in_scope": total_in_scope,
-        "validated": len(url_list),
-        "truncated": truncated,
-        "cap": MAX_ENDPOINTS_TO_VALIDATE,
-    }))
     Log.info(f"    {C.GREEN}[+]{C.RESET} Probing {len(url_list)} URLs "
              f"({THREAD_POOL_WORKERS} concurrent, {ENDPOINT_CHECK_TIMEOUT}s timeout)")
 
@@ -2743,16 +2805,22 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
 
     title_re = re.compile(rb"<title[^>]*>([^<]+)</title>", re.IGNORECASE)
 
-    def check(url):
+    # SAFETY: we only ever send non-mutating methods. A route whose recorded
+    # method is POST/PUT/PATCH/DELETE is probed with GET for existence and with
+    # OPTIONS to read its Allow header — we never fire the mutating verb itself.
+    _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+    def check(url, method="GET"):
         try:
-            req = urllib.request.Request(url, headers=header_dict, method="GET")
+            req = urllib.request.Request(url, headers=header_dict, method=method)
             with urllib.request.urlopen(req, context=ctx, timeout=ENDPOINT_CHECK_TIMEOUT) as resp:
                 status = resp.status
                 ct = resp.headers.get("Content-Type", "") or ""
                 cl_hdr = resp.headers.get("Content-Length", "")
+                allow = resp.headers.get("Allow", "") or ""
                 body = b""
                 # Read a small chunk for HTML to extract title
-                if "html" in ct.lower():
+                if method == "GET" and "html" in ct.lower():
                     body = resp.read(8192)
                 title = None
                 if body:
@@ -2761,29 +2829,63 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
                         title = m.group(1).decode("utf-8", errors="replace").strip()[:120]
                 size = int(cl_hdr) if cl_hdr.isdigit() else (len(body) if body else None)
                 return {"url": url, "status": status, "size": size,
-                        "content_type": ct.split(";")[0].strip(), "title": title}
+                        "content_type": ct.split(";")[0].strip(), "title": title,
+                        "allow": allow}
         except urllib.error.HTTPError as e:
             return {"url": url, "status": e.code, "size": None,
-                    "content_type": "", "title": None}
+                    "content_type": "", "title": None,
+                    "allow": (e.headers.get("Allow", "") if e.headers else "") or ""}
         except Exception as e:
             return {"url": url, "status": None, "error": str(e)[:60],
-                    "size": None, "content_type": "", "title": None}
+                    "size": None, "content_type": "", "title": None, "allow": ""}
+
+    def probe(url):
+        """GET for existence; add an OPTIONS pass when the endpoint is known to
+        be non-GET or GET looks unsupported, to capture allowed methods safely."""
+        methods = url_methods.get(url, {"GET"})
+        r = check(url, "GET")
+        non_get = methods - {"GET"}
+        if (non_get and not non_get & _SAFE_METHODS) or r.get("status") in (404, 405):
+            opt = check(url, "OPTIONS")
+            allow = opt.get("allow") or r.get("allow")
+            if allow:
+                r["allow"] = allow
+            if r.get("status") in (404, 405) and opt.get("status") not in (None, 404, 405):
+                r["options_status"] = opt.get("status")
+        r["recorded_methods"] = sorted(methods)
+        return r
+
+    # Learn the server's soft-404 / catch-all fingerprint before probing so we
+    # can tell real hits from an SPA that answers 200 for everything.
+    catch_all = soft404_signatures(check, target_base)
+    if catch_all:
+        sig = next(iter(catch_all))
+        Log.info(f"    {C.DIM}↳ catch-all detected: unknown paths return "
+                 f"{sig[0]} {sig[2] or ''} ~{sig[1]} bytes — matching 2xx/3xx will be "
+                 f"flagged soft-404{C.RESET}")
 
     results = []
     with ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS) as pool:
-        futures = [pool.submit(check, u) for u in url_list]
+        futures = [pool.submit(probe, u) for u in url_list]
         for fut in as_completed(futures):
             results.append(fut.result())
+
+    for r in results:
+        r["soft404"] = is_soft404(r, catch_all)
 
     output_file = output_dir / "live-endpoints.json"
     with output_file.open("w") as f:
         for r in results:
             f.write(json.dumps(r) + "\n")
 
-    # Summary by status class
+    # Summary by status class. Soft-404s are counted apart so a wall of catch-all
+    # 200s doesn't masquerade as real hits.
     by_class = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0, "error": 0}
     auth_protected = 0
+    soft404_count = sum(1 for r in results if r.get("soft404"))
     for r in results:
+        if r.get("soft404"):
+            continue
         s = r.get("status")
         if s is None:
             by_class["error"] += 1
@@ -2798,13 +2900,28 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
         elif 500 <= s < 600:
             by_class["5xx"] += 1
 
-    Log.info(f"    {C.GREEN}[+]{C.RESET} 2xx: {by_class['2xx']}  3xx: {by_class['3xx']}  "
+    soft_note = f"  soft-404: {soft404_count}" if soft404_count else ""
+    Log.info(f"    {C.GREEN}[+]{C.RESET} real 2xx: {by_class['2xx']}  3xx: {by_class['3xx']}  "
              f"4xx: {by_class['4xx']} ({auth_protected} auth-protected)  "
-             f"5xx: {by_class['5xx']}  errors: {by_class['error']}")
+             f"5xx: {by_class['5xx']}  errors: {by_class['error']}{soft_note}")
+    if soft404_count:
+        Log.info(f"    {C.DIM}↳ {soft404_count} response(s) matched the catch-all page "
+                 f"(SPA serves index.html for unknown paths) — not real endpoints{C.RESET}")
     if auth_protected > 0:
         Log.info(f"    {C.DIM}↳ {auth_protected} auth-protected endpoint(s) — priority targets, real functionality lives behind these{C.RESET}")
     if by_class["5xx"] > 0:
         Log.info(f"    {C.DIM}↳ {by_class['5xx']} server error(s) — often interesting, check with crafted input{C.RESET}")
+
+    (output_dir / "live-endpoints-meta.json").write_text(json.dumps({
+        "total_in_scope": total_in_scope,
+        "validated": len(url_list),
+        "truncated": truncated,
+        "cap": MAX_ENDPOINTS_TO_VALIDATE,
+        "soft404_count": soft404_count,
+        "catch_all_detected": bool(catch_all),
+        "catch_all_signature": (lambda s: {"status": s[0], "size": s[1], "content_type": s[2]})
+                               (next(iter(catch_all))) if catch_all else None,
+    }))
     return output_file
 
 
@@ -6353,10 +6470,12 @@ def generate_report(target, output_dir, results):
         "Redirects (3xx)":           ([], "neutral"),
         "Other 4xx":                 ([], "warning"),
         "Connection error":          ([], "warning"),
+        "Soft-404 / catch-all (ignored)": ([], "neutral"),
     }
     for e in live_eps:
         s = e.get("status")
-        if s is None:             live_groups["Connection error"][0].append(e)
+        if e.get("soft404"):      live_groups["Soft-404 / catch-all (ignored)"][0].append(e)
+        elif s is None:           live_groups["Connection error"][0].append(e)
         elif s in (401, 403):     live_groups["Auth-protected (401/403)"][0].append(e)
         elif 200 <= s < 300:      live_groups["Successful (2xx)"][0].append(e)
         elif 300 <= s < 400:      live_groups["Redirects (3xx)"][0].append(e)
@@ -6377,12 +6496,25 @@ def generate_report(target, output_dir, results):
     if live_meta.get("truncated"):
         title += f" ({live_meta.get('validated', 0)} of {live_meta.get('total_in_scope', '?')} probed)"
 
-    parts.append(section("live", title, len(live_eps), live_badge, open_=bool(live_eps)))
+    # Badge should reflect real hits, not a wall of catch-all 200s.
+    soft_n = len(live_groups["Soft-404 / catch-all (ignored)"][0])
+    real_n = len(live_eps) - soft_n
+    badge_txt = f"{real_n} real" + (f" · {soft_n} soft-404" if soft_n else "")
+    parts.append(section("live", title, badge_txt, live_badge, open_=bool(live_eps)))
     if live_meta.get("truncated"):
         parts.append(
             f"<div class='notice warn'>⚠ Only the top {live_meta.get('validated', 0)} "
             f"of {live_meta.get('total_in_scope', '?')} in-scope endpoints were probed "
             f"(API/short-path priority). Pass <code>--max-endpoints 0</code> for unlimited.</div>"
+        )
+    if live_meta.get("catch_all_detected"):
+        sig = live_meta.get("catch_all_signature") or {}
+        parts.append(
+            f"<div class='notice warn'>⚠ Catch-all routing detected: unknown paths return "
+            f"<code>{html_escape(str(sig.get('status','?')))} "
+            f"{html_escape(str(sig.get('content_type','') or ''))} ~{html_escape(str(sig.get('size','?')))} bytes</code>. "
+            f"{soft_n} response(s) matching this are grouped as soft-404 below — they are "
+            f"<strong>not real endpoints</strong>, the SPA just serves index.html.</div>"
         )
     if not live_eps:
         parts.append("<p class='empty'>No endpoints probed.</p>")
@@ -6390,20 +6522,29 @@ def generate_report(target, output_dir, results):
         parts.append("<p class='empty'>Auth-protected and 5xx responses deserve manual review first.</p>")
         for label, (items, bcls) in live_groups.items():
             if not items: continue
+            soft_grp = label.startswith("Soft-404")
             open_sub = label in ("Auth-protected (401/403)", "Server error (5xx)")
             parts.append(sub(label, len(items), bcls, open_=open_sub))
-            parts.append("<table><thead><tr><th>Status</th><th>URL</th><th>Type</th><th>Size</th><th>Title</th></tr></thead><tbody>")
+            if soft_grp:
+                parts.append("<p class='empty'>Matched the catch-all signature — listed for "
+                             "completeness only. Real content lives in the other groups.</p>")
+            parts.append("<table><thead><tr><th>Status</th><th>URL</th><th>Type</th><th>Size</th>"
+                         "<th>Allow</th><th>Title</th></tr></thead><tbody>")
             for e in items[:100]:
                 s = e.get("status")
                 s_str = str(s) if s is not None else html_escape(e.get("error","ERR"))
+                if e.get("options_status"):
+                    s_str += f" <span class='badge neutral'>OPTIONS {html_escape(str(e['options_status']))}</span>"
                 size  = e.get("size"); size_str = f"{size:,}" if isinstance(size,int) else ""
+                allow = html_escape(e.get("allow") or "")
                 parts.append(f"<tr><td><code>{s_str}</code></td>"
                              f"<td><code>{html_escape(e.get('url',''))}</code></td>"
                              f"<td><code>{html_escape(e.get('content_type') or '')}</code></td>"
                              f"<td>{size_str}</td>"
+                             f"<td><code>{allow}</code></td>"
                              f"<td>{html_escape(e.get('title') or '')}</td></tr>")
             if len(items) > 100:
-                parts.append(f"<tr><td colspan='5' class='empty'>{len(items)-100} more — see live-endpoints.json</td></tr>")
+                parts.append(f"<tr><td colspan='6' class='empty'>{len(items)-100} more — see live-endpoints.json</td></tr>")
             parts.append("</tbody></table>")
             parts.append(end_sub())
     parts.append(end_section())
@@ -6562,14 +6703,14 @@ def generate_report(target, output_dir, results):
             data    = json.loads(Path(retire_file).read_text(encoding="utf-8", errors="replace"))
             entries = data.get("data",[]) if isinstance(data,dict) else data
             for entry in entries:
-                fname = Path(entry.get("file","?")).name
+                fpath = entry.get("file","?")   # full analysed path (js-clean/ or bundles/)
                 for r in entry.get("results",[]):
                     key = f"{r.get('component','?')}_at_{r.get('version','?')}"
                     if key not in retire_libs:
                         retire_libs[key] = {"component":r.get("component","?"),
                                             "version":r.get("version","?"),
                                             "files":set(), "vulns":[]}
-                    retire_libs[key]["files"].add(fname)
+                    retire_libs[key]["files"].add(fpath)
                     for v in (r.get("vulnerabilities") or []):
                         retire_libs[key]["vulns"].append(v)
         except Exception as e:
@@ -6601,10 +6742,19 @@ def generate_report(target, output_dir, results):
             for v in lib["vulns"]:
                 for c in ((v.get("identifiers") or {}).get("CVE") or []): cves.add(c)
             cves_str = html_escape(", ".join(sorted(cves))) if cves else f"{len(lib['vulns'])} advisories"
+            # "Found in" — one filename + copy-path button per file, like every
+            # other section (file_cell renders a whole <td>, so build inline here).
+            file_bits = []
+            for full in sorted(lib["files"]):
+                name = Path(full).name
+                file_bits.append(
+                    f"<div class='file-cell'><code title='{html_escape(full)}'>"
+                    f"{html_escape(name)}</code>{copy_btn(full)}</div>")
+            files_cell = "".join(file_bits) if file_bits else "—"
             parts.append(f"<tr><td><code>{html_escape(lib['component'])}</code></td>"
                         f"<td><code>{html_escape(lib['version'])}</code></td>"
                         f"<td>{sev_badges}</td><td><code>{cves_str}</code></td>"
-                        f"<td><code>{html_escape(', '.join(sorted(lib['files']))[:120])}</code></td></tr>")
+                        f"<td>{files_cell}</td></tr>")
         parts.append("</tbody></table>")
     else:
         parts.append(f"<p class='empty'>{len(retire_libs)} libraries detected — none with known vulnerabilities.</p>")
