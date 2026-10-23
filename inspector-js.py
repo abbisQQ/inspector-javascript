@@ -20,10 +20,24 @@ Pipeline stages:
   5b   Static metadata analysis      — source maps, JSON files, developer comments
   5c   HTTP call + secret extraction — fetch/axios/XHR/Express routes, JWT/AWS/key patterns
   5d   Wayback maps                  — historically captured .js.map files (CDX API)
+  5e   Runtime config discovery      — fetch the JSON config the app loads at runtime
   6    Semgrep SAST                  — DOM sinks, eval, open redirect, cookie misconfig
   7    Retire.js                     — known-vulnerable library fingerprinting
   8    TruffleHog                    — secret/credential detection
   9    HTML report                   — dark-themed, collapsible, self-contained
+
+Source layout (this file is intentionally single-file — scp one script and run;
+jump between sections by searching for the "# ---------- <name> ----------" banners):
+  Pipeline constants · Banner + colors · Logging · Tool checks
+  Scope + redirect helpers · Shared HTTP / I/O helpers · Subprocess helper
+  Stages 1-9 + 5e, each under its own "Stage N:" banner, in pipeline order
+  Local directory mode (--dir): source collection
+  HTML report  (generate_report + templates)
+  Terminal wizard (-i)  ·  Web wizard (--serve): HTTP handler, SSE, job registry
+  Main (argparse, profile resolution, pipeline driver)
+
+Tests:  python3 -m unittest discover -s tests        (no third-party deps)
+Lint:   ruff check .                                 (config in ruff.toml)
 
 Usage:
   ./inspector-js.py -u https://target.com
@@ -7458,8 +7472,6 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
     return report_path
 
 
-# ---------- Main ----------
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal interactive wizard (--interactive / -i)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8680,6 +8692,8 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
         print(f"\n  {C.YELLOW}shutting down{C.RESET}")
         httpd.shutdown()
 
+
+# ---------- Main (argparse, profile resolution, pipeline driver) ----------
 
 class HelpfulArgumentParser(argparse.ArgumentParser):
     """Print full help on any argparse error (missing arg, bad value, etc.)."""
