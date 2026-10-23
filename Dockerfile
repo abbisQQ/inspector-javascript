@@ -14,7 +14,7 @@ RUN go install github.com/projectdiscovery/katana/cmd/katana@latest    \
 # ─────────────────────────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
-LABEL org.opencontainers.image.title="jspect"
+LABEL org.opencontainers.image.title="Inspector-Javascript"
 LABEL org.opencontainers.image.description="Automated JavaScript security analysis pipeline — Katana · JSluice · Semgrep · TruffleHog · Retire.js"
 LABEL org.opencontainers.image.licenses="MIT"
 
@@ -66,15 +66,15 @@ ENV SEMGREP_SEND_METRICS=off
 ENV JSPECT_DOCKER=1
 
 # ── Tool ──────────────────────────────────────────────────────────────────────
-WORKDIR /jspect
-COPY jspect.py .
+WORKDIR /inspector-js
+COPY inspector-js.py .
 
 # Reports are written to /output. Mount a host directory here:
-#   docker run --rm -v $(pwd)/out:/output jspect -u https://target.com
+#   docker run --rm -v $(pwd)/out:/output inspector-js -u https://target.com
 # To analyse a local source tree, also mount it read-only:
 #   docker run --rm -v $(pwd)/out:/output -v /path/to/src:/target:ro \
-#              jspect --dir /target -u https://target.com
+#              inspector-js --dir /target -u https://target.com
 VOLUME ["/output"]
 WORKDIR /output
 
-ENTRYPOINT ["python3", "/jspect/jspect.py"]
+ENTRYPOINT ["python3", "/inspector-js/inspector-js.py"]
