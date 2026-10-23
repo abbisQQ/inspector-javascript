@@ -1,6 +1,12 @@
-# jspect
+<p align="center">
+  <img src="assets/logo.svg" width="150" alt="Inspector-Javascript logo">
+</p>
 
-Automated JavaScript security analysis pipeline. Crawls a target, pulls every JS asset, runs the standard tool chain (Katana → JSluice → Semgrep → Retire.js → TruffleHog) plus a few extras (source-map blind-probe, Wayback, well-known files, AJAX spider), and produces a single self-contained HTML report.
+<h1 align="center">Inspector-Javascript</h1>
+
+<p align="center"><em>the JavaScript inspector</em> · <code>ijs</code></p>
+
+Automated JavaScript security analysis pipeline. Crawls a target, pulls every JS asset, runs the standard tool chain (Katana → JSluice → Semgrep → Retire.js → TruffleHog) plus a few extras (source-map blind-probe, Wayback, well-known files, AJAX spider, soft-404-aware endpoint probing, runtime-config discovery), and produces a single self-contained HTML report.
 
 ---
 
@@ -8,13 +14,13 @@ Automated JavaScript security analysis pipeline. Crawls a target, pulls every JS
 
 ```bash
 # 1. CLI — one command
-jspect -u https://target.com
+ijs -u https://target.com
 
 # 2. Terminal wizard — guided prompts
-jspect -i
+ijs -i
 
 # 3. Web wizard — browser UI on localhost
-jspect --serve
+ijs --serve
 ```
 
 The web wizard also accepts a **raw Burp request** (paste from Burp's "Copy request" clipboard) and auto-extracts URL + cookies + auth headers.
@@ -26,14 +32,14 @@ The web wizard also accepts a **raw Burp request** (paste from Burp's "Copy requ
 ### Docker (recommended — bundles every dependency)
 
 ```bash
-git clone https://github.com/abbisQQ/jspect
-cd jspect
-docker build -t jspect .
+git clone https://github.com/abbisQQ/ijs
+cd ijs
+docker build -t ijs .
 
 # Then any of:
-docker run --rm -v $(pwd)/out:/output jspect -u https://target.com
-docker run --rm -it -v $(pwd)/out:/output jspect -i
-docker run --rm -p 8765:8765 -v $(pwd)/out:/output jspect --serve --bind 0.0.0.0
+docker run --rm -v $(pwd)/out:/output ijs -u https://target.com
+docker run --rm -it -v $(pwd)/out:/output ijs -i
+docker run --rm -p 8765:8765 -v $(pwd)/out:/output ijs --serve --bind 0.0.0.0
 ```
 
 ### Native (macOS / Linux)
@@ -49,7 +55,7 @@ brew install trufflehog                                  # or: see install.sh on
 playwright install chromium                              # only for --ajax-spider
 ```
 
-Run with `python3 jspect.py -u https://target.com`.
+Run with `python3 ijs.py -u https://target.com`.
 
 ---
 
@@ -65,7 +71,7 @@ Pick the intensity. Most flags below are bundled into these:
 | `gentle` | 1 | 200 | off | off | off | Polite to small / fragile targets |
 
 ```bash
-jspect -u https://target.com --profile gentle
+ijs -u https://target.com --profile gentle
 ```
 
 ---
@@ -88,9 +94,9 @@ jspect -u https://target.com --profile gentle
 ### Authenticated scan (any of these works)
 
 ```bash
-jspect -u https://app.example.com -H "Cookie: session=..." -H "Authorization: Bearer eyJ..."
-jspect --from-burp /path/to/burp-request.txt
-pbpaste | jspect --from-burp -                   # macOS — pipe a Burp clipboard
+ijs -u https://app.example.com -H "Cookie: session=..." -H "Authorization: Bearer eyJ..."
+ijs --from-burp /path/to/burp-request.txt
+pbpaste | ijs --from-burp -                   # macOS — pipe a Burp clipboard
 ```
 
 ### Local source folder (`--dir`)
@@ -101,10 +107,10 @@ JS/TS/JSX/Vue files (plus extension-less webpack modules), and also `.json`,
 keep their real relative paths under `js-clean/`.
 
 ```bash
-jspect --dir ~/src/app                                  # static analysis only
-jspect --dir ~/src/app -u https://app.example.com       # + probe found endpoints live
-jspect --dir ~/src/app --node-modules all               # also analyse public npm packages
-jspect --dir ~/src/app --exclude 'test/*' --exclude '*.spec.js'
+ijs --dir ~/src/app                                  # static analysis only
+ijs --dir ~/src/app -u https://app.example.com       # + probe found endpoints live
+ijs --dir ~/src/app --node-modules all               # also analyse public npm packages
+ijs --dir ~/src/app --exclude 'test/*' --exclude '*.spec.js'
 ```
 
 - `--node-modules auto` (default) skips well-known public packages (react,
@@ -120,7 +126,7 @@ jspect --dir ~/src/app --exclude 'test/*' --exclude '*.spec.js'
 ### Pipe everything through Burp
 
 ```bash
-jspect -u https://target.com --proxy http://127.0.0.1:8080 --proxy-insecure
+ijs -u https://target.com --proxy http://127.0.0.1:8080 --proxy-insecure
 ```
 
 Every request — Katana crawl, JS downloads, live-validation probes, well-known, Wayback, AJAX spider, blind source-map probes — appears in Burp's sitemap.
@@ -150,7 +156,7 @@ Empty sections collapse to a single "no findings" line — the report stays scan
 
 ## The web wizard
 
-`jspect --serve` boots a localhost-only HTTP server (default `127.0.0.1:8765`). Three pages:
+`ijs --serve` boots a localhost-only HTTP server (default `127.0.0.1:8765`). Three pages:
 
 | URL | Page |
 |-----|------|
@@ -163,7 +169,7 @@ Submits a scan as a subprocess; **Stop scan** sends SIGTERM (3s grace) → SIGKI
 To expose externally (use a VPN — there's no auth):
 
 ```bash
-jspect --serve --bind 0.0.0.0 --port 8765
+ijs --serve --bind 0.0.0.0 --port 8765
 ```
 
 ---
@@ -196,7 +202,7 @@ Each stage is graceful — missing tools / failed crawls / empty corpora don't b
 
 ## Acknowledgments
 
-jspect orchestrates a pipeline of excellent open-source tools — full credit to their authors.
+ijs orchestrates a pipeline of excellent open-source tools — full credit to their authors.
 
 **Required binaries**
 - [Katana](https://github.com/projectdiscovery/katana) (ProjectDiscovery) — web crawler

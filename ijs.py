@@ -1,6 +1,6 @@
 #!/opt/homebrew/bin/python3.11
 """
-jspect.py — Automated JavaScript analysis pipeline for web app pentesting.
+ijs.py — Automated JavaScript analysis pipeline for web app pentesting.
 
 Two operating modes:
   URL mode  (-u)    Crawl a live target, download its JS, then analyse it.
@@ -26,12 +26,12 @@ Pipeline stages:
   9    HTML report                   — dark-themed, collapsible, self-contained
 
 Usage:
-  ./jspect.py -u https://target.com
-  ./jspect.py -u https://target.com -H "Cookie: session=abc123"
-  ./jspect.py -u https://target.com -H "Authorization: Bearer eyJ..." -d 6
-  ./jspect.py -u https://target.com --verify-secrets       # ROE permitting
-  ./jspect.py --dir /path/to/NodeGoat                      # local source analysis
-  ./jspect.py --dir /path/to/NodeGoat -u http://localhost:4000  # combined
+  ./ijs.py -u https://target.com
+  ./ijs.py -u https://target.com -H "Cookie: session=abc123"
+  ./ijs.py -u https://target.com -H "Authorization: Bearer eyJ..." -d 6
+  ./ijs.py -u https://target.com --verify-secrets       # ROE permitting
+  ./ijs.py --dir /path/to/NodeGoat                      # local source analysis
+  ./ijs.py --dir /path/to/NodeGoat -u http://localhost:4000  # combined
 """
 
 import argparse
@@ -127,13 +127,12 @@ class C:
 
 
 BANNER = rf"""{C.CYAN}{C.BOLD}
-   _                 _
-  (_)____ __  ___ __| |_
-  | (_-< '_ \/ -_) _|  _|
- _/ /__/ .__/\___\__|\__|
-|__/   |_|                {C.RESET}{C.DIM}v1.0{C.RESET}
-{C.DIM}     Automated JavaScript Analysis Pipeline
-     Katana → JSluice → Semgrep → TruffleHog{C.RESET}
+       .------.
+      /        \     {C.RESET}{C.BOLD}Inspector-Javascript{C.RESET}{C.DIM} v1.1{C.CYAN}{C.BOLD}
+     |   {{ }}    |    {C.RESET}{C.DIM}the JavaScript inspector{C.CYAN}{C.BOLD}
+      \        /
+       '------'\     {C.RESET}{C.DIM}Katana → JSluice → Semgrep → TruffleHog{C.CYAN}{C.BOLD}
+               \{C.RESET}
 """
 
 
@@ -522,7 +521,7 @@ def parse_headers(headers):
         if ":" in h:
             k, v = h.split(":", 1)
             out[k.strip()] = v.strip()
-    out.setdefault("User-Agent", "Mozilla/5.0 jspect/1.0")
+    out.setdefault("User-Agent", "Mozilla/5.0 ijs/1.0")
     return out
 
 
@@ -557,7 +556,7 @@ def fetch_url(url, headers=None, timeout=15, max_bytes=None):
 
 def _random_probe_path() -> str:
     """A path that almost certainly doesn't exist, for soft-404 baselining."""
-    return "/" + hashlib.sha1(os.urandom(16)).hexdigest()[:24] + "/jspect-probe-404"
+    return "/" + hashlib.sha1(os.urandom(16)).hexdigest()[:24] + "/ijs-probe-404"
 
 
 def soft404_signatures(probe_fn, base_url: str, n: int = 3) -> set:
@@ -906,16 +905,16 @@ _DESTRUCTIVE_TEXT_RE = re.compile(
 # admin) can immediately tell it came from an automated tool.
 def _spider_fake_value(input_type: str, name: str) -> str:
     """Return a recognisably-fake value to type into a form field.
-    Uses obvious markers (`jspect-test+`, `Lorem ipsum jspect scan`) so the
+    Uses obvious markers (`ijs-test+`, `Lorem ipsum ijs scan`) so the
     recipient can tell it came from an automated scanner.
     """
     name_l = (name or "").lower()
     rand_suffix = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
     if input_type in ("email",) or "email" in name_l or "mail" in name_l:
-        return f"jspect-test+{rand_suffix}@example.com"
+        return f"ijs-test+{rand_suffix}@example.com"
     if input_type in ("url",) or "url" in name_l or "website" in name_l:
-        return "https://example.com/jspect-test"
+        return "https://example.com/ijs-test"
     if input_type == "tel" or "phone" in name_l or "mobile" in name_l:
         return "+15555550100"   # 555-01xx is non-dialable reserved range
     if input_type == "number":
@@ -923,9 +922,9 @@ def _spider_fake_value(input_type: str, name: str) -> str:
     if input_type == "date":
         return "2026-01-01"
     if input_type == "search":
-        return "jspect"
+        return "ijs"
     # Default: free text. Make sure it's obviously a test.
-    return "Lorem ipsum jspect scan test"
+    return "Lorem ipsum ijs scan test"
 
 
 # Form-fill modes: how aggressive the spider is with <form> elements.
@@ -1513,7 +1512,7 @@ def ajax_spider(target: str,
                 extra_http_headers={k: v for k, v in header_dict.items()
                                     if k.lower() != "user-agent"},
                 user_agent=header_dict.get("User-Agent",
-                                            "Mozilla/5.0 jspect/1.0"),
+                                            "Mozilla/5.0 ijs/1.0"),
             )
 
             for page_url in page_urls:
@@ -2973,7 +2972,7 @@ def _is_openapi_doc(data) -> bool:
 
 
 def extract_openapi_endpoints(data: dict, source_url: str) -> list:
-    """Turn a parsed Swagger/OpenAPI doc into jspect endpoint records. Purely
+    """Turn a parsed Swagger/OpenAPI doc into ijs endpoint records. Purely
     structural — no per-target or per-vendor assumptions. Shared by the static
     JSON analysis and the live runtime-config discovery stage."""
     out = []
@@ -3411,7 +3410,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
     ctx = permissive_ssl_context()
 
     try:
-        req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 jspect/1.0"})
+        req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT, context=ctx) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         cdx_rows: list[list[str]] = json.loads(raw)
@@ -3450,7 +3449,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
         # Download the archived copy regardless — it may differ from the live version
         wb_url = _WB_FETCH.format(timestamp=timestamp, url=orig_url)
         try:
-            req2 = urllib.request.Request(wb_url, headers={"User-Agent": "Mozilla/5.0 jspect/1.0"})
+            req2 = urllib.request.Request(wb_url, headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
             with urllib.request.urlopen(req2, timeout=_WB_DL_TIMEOUT, context=ctx) as resp2:
                 wb_status  = resp2.getcode()
                 wb_body    = resp2.read().decode("utf-8", errors="replace")
@@ -3607,7 +3606,7 @@ def _google_cse_search(query: str, api_key: str, cse_id: str,
         )
         try:
             req = urllib.request.Request(api_url,
-                headers={"User-Agent": "Mozilla/5.0 jspect/1.0"})
+                headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
             with urllib.request.urlopen(req, timeout=15,
                                         context=permissive_ssl_context()) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
@@ -3638,7 +3637,7 @@ def _query_cdx_for_ext(domain: str, ext: str, limit: int = 200) -> list[tuple[st
     url = _CDX_API + "?" + _up.urlencode(params)
     try:
         req = urllib.request.Request(url,
-            headers={"User-Agent": "Mozilla/5.0 jspect/1.0"})
+            headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT,
                                     context=permissive_ssl_context()) as resp:
             rows = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -4649,7 +4648,7 @@ def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoi
 
     # ── Fetch + analyse ─────────────────────────────────────────────────────
     findings = []            # [{url, source, type, sensitive_keys, extracted_urls, secrets}]
-    new_endpoints = []       # jspect endpoint records to feed back into probing
+    new_endpoints = []       # ijs endpoint records to feed back into probing
     config_secrets = []      # [{kind, match, file, source}]
     seen_secret = set()
     fetched = soft_skipped = 0
@@ -5572,8 +5571,8 @@ rules:
 # contents are appended to the defaults at scan time. The file format is just
 # a Semgrep `rules:` document; everything Semgrep accepts works.
 #   View / edit / save / reset from the web wizard at /rules
-#   Or `jspect --rules-path` to print the path + edit manually.
-USER_RULES_PATH = Path.home() / ".config" / "jspect" / "rules.yaml"
+#   Or `ijs --rules-path` to print the path + edit manually.
+USER_RULES_PATH = Path.home() / ".config" / "ijs" / "rules.yaml"
 
 
 def get_effective_rules() -> str:
@@ -6275,7 +6274,7 @@ def generate_report(target, output_dir, results):
     parts.append("<head>")
     parts.append("<meta charset='utf-8'>")
     parts.append("<meta name='viewport' content='width=device-width,initial-scale=1'>")
-    parts.append(f"<title>JS Analysis — {html_escape(target)}</title>")
+    parts.append(f"<title>Inspector-Javascript — {html_escape(target)}</title>")
     parts.append(f"<style>{HTML_CSS}</style>")
     parts.append("</head>")
     parts.append("<body>")
@@ -6289,7 +6288,7 @@ def generate_report(target, output_dir, results):
                                      results.get("secrets_ext_count", 0)) else ""
 
     parts.append("<nav>")
-    parts.append("<span class='nav-brand'>🔍 jspect</span>")
+    parts.append("<span class='nav-brand'>🔍 ijs</span>")
     parts.append("<div class='nav-links'>")
     # Minimalism: skip nav links to sections that won't render any content.
     # Each tuple is (href, label, css class, should-show predicate).
@@ -6333,7 +6332,7 @@ def generate_report(target, output_dir, results):
     # ── page header ──────────────────────────────────────────────────
     parts.append("<div class='container'>")
     parts.append("<header>")
-    parts.append("<h1>JavaScript Analysis Report</h1>")
+    parts.append("<h1>🔍 Inspector-Javascript <span style='font-weight:400;opacity:.6'>— analysis report</span></h1>")
     parts.append("<dl class='meta'>")
     parts.append(f"<dt>Target</dt><dd><code>{html_escape(target)}</code></dd>")
     parts.append(f"<dt>Run</dt><dd>{html_escape(now)}</dd>")
@@ -7423,8 +7422,8 @@ def generate_report(target, output_dir, results):
 
     # ── Footer ───────────────────────────────────────────────────────
     parts.append(
-        f"<footer>Generated by <a href='https://github.com/abbisQQ/jspect' "
-        f"style='color:inherit;text-decoration:underline'>jspect</a> · "
+        f"<footer>Generated by <a href='https://github.com/abbisQQ/ijs' "
+        f"style='color:inherit;text-decoration:underline'>ijs</a> · "
         f"{html_escape(now)}<br>"
         f"<span style='font-size:10px;color:var(--text-dim)'>"
         f"Powered by Katana · JSluice · Semgrep · Retire.js · TruffleHog · "
@@ -7543,7 +7542,7 @@ def _wiz_ask_headers() -> list:
 def _wiz_equivalent_cli(args) -> str:
     """Build the CLI you'd type to repeat this scan without the wizard."""
     q = shlex.quote
-    parts = ["jspect"]
+    parts = ["ijs"]
     if args.url:
         parts.append(f"-u {q(args.url)}")
     if args.dir:
@@ -7764,7 +7763,7 @@ _WEB_FORM_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>jspect</title>
+<title>Inspector-Javascript</title>
 <style>
 :root {
     --bg:#0f1115; --surface:#171a21; --surface-2:#1f242e; --border:#2a303c;
@@ -7820,8 +7819,8 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 </head>
 <body>
 <div class="container">
-  <h1>🔍 <span>jspect</span></h1>
-  <div class="tag">JavaScript security analysis pipeline · web wizard</div>
+  <h1>🔍 <span>Inspector-Javascript</span></h1>
+  <div class="tag">the JavaScript inspector · web wizard</div>
 
   <form id="scanForm" method="POST" action="/scan">
 
@@ -7913,7 +7912,7 @@ document.getElementById('scanForm').addEventListener('submit', syncRequired);
 _WEB_PROGRESS_HTML = """<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><title>jspect · scanning {target}</title>
+<meta charset="utf-8"><title>Inspector-Javascript · scanning {target}</title>
 <style>
 :root { --bg:#0f1115; --surface:#171a21; --border:#2a303c; --text:#e6e8ec;
         --dim:#8b93a3; --accent:#5eead4; --ok:#10b981; --warn:#f59e0b; --err:#ef4444; }
@@ -7946,7 +7945,7 @@ h1 { font-size:18px; margin:0 0 4px; color:var(--accent); font-weight:600; }
 </head>
 <body>
 <div class="container">
-  <h1>🔍 jspect — scanning</h1>
+  <h1>🔍 Inspector-Javascript — scanning</h1>
   <div class="target">{target}</div>
   <div class="actions">
     <a class="btn primary" id="reportBtn" disabled>Open report</a>
@@ -8027,12 +8026,12 @@ WEB_LOG_QUEUE_MAX      = 10_000     # cap per-job log queue (drops oldest entrie
 WEB_CANCEL_GRACE_S     = 3          # SIGTERM grace before SIGKILL on /cancel
 WEB_SSE_KEEPALIVE_S    = 30         # idle ping interval on /events/<id>
 WEB_JOB_ID_BYTES       = 8          # bytes of entropy in secrets.token_urlsafe()
-WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/jspect-web")   # where /scans listing reads from
+WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/ijs-web")   # where /scans listing reads from
 
 
 # ── /rules page template ─────────────────────────────────────────────────────
 _WEB_RULES_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>jspect · Semgrep rules</title>
+<html lang="en"><head><meta charset="utf-8"><title>Inspector-Javascript · Semgrep rules</title>
 <style>
 :root { --bg:#0f1115; --surface:#171a21; --surface-2:#1f242e; --border:#2a303c;
         --text:#e6e8ec; --dim:#8b93a3; --accent:#5eead4;
@@ -8071,7 +8070,7 @@ nav a { margin-right:14px; }
     <a href="/rules">⚙️ rules</a>
   </nav>
   <h1>⚙️ Semgrep rules</h1>
-  <div class="sub">Defaults ship with jspect. Add your own rules below — they're appended to the default ruleset on every scan.</div>
+  <div class="sub">Defaults ship with Inspector-Javascript. Add your own rules below — they're appended to the default ruleset on every scan.</div>
 
   <h2>Default rules (read-only)</h2>
   <textarea readonly rows="14">{default_rules}</textarea>
@@ -8164,7 +8163,7 @@ def _web_guess_content_type(suffix: str) -> str:
 
 
 def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> None:
-    """Run jspect again as a subprocess so its stdout streams cleanly per-job.
+    """Run ijs again as a subprocess so its stdout streams cleanly per-job.
     Pushes each output line into the job's Queue for SSE consumption."""
     import subprocess as _subprocess
     cmd = [sys.executable, __file__]
@@ -8247,20 +8246,21 @@ def run_web_wizard(args) -> None:
                 return
 
             # ── /scans — list every past scan directory on disk ──────────────
-            # Each entry is a directory under /tmp/jspect-web/ (the default
+            # Each entry is a directory under /tmp/ijs-web/ (the default
             # output location for web jobs). Clicking one lands you on the
             # same /files/ tree the live progress page links to, AND on the
             # report if present. Survives server restarts.
             if self.path == "/scans" or self.path == "/scans/":
-                web_root = Path("/tmp/jspect-web")
+                web_root = Path("/tmp/ijs-web")
                 scans = []
                 if web_root.is_dir():
                     for d in sorted(web_root.iterdir(),
                                      key=lambda p: p.stat().st_mtime, reverse=True):
                         if not d.is_dir():
                             continue
-                        # Parse "jspect-<host>-<YYYYMMDD>-<HHMMSS>" → host + ts
-                        m = re.match(r"jspect-(.+)-(\d{8}-\d{6})$", d.name)
+                        # Parse "ijs-<host>-<YYYYMMDD>-<HHMMSS>" → host + ts
+                        # (also match the legacy "ijs-" prefix so old scans still list)
+                        m = re.match(r"(?:ijs|jspect)-(.+)-(\d{8}-\d{6})$", d.name)
                         host = m.group(1) if m else d.name
                         ts   = m.group(2) if m else ""
                         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
@@ -8268,7 +8268,7 @@ def run_web_wizard(args) -> None:
                         scans.append((d.name, host, ts, size, has_report))
                 rows = []
                 if not scans:
-                    rows.append('<tr><td colspan="4" class="empty">No past scans in /tmp/jspect-web/</td></tr>')
+                    rows.append('<tr><td colspan="4" class="empty">No past scans in /tmp/ijs-web/</td></tr>')
                 else:
                     for name, host, ts, size, has_report in scans:
                         ts_fmt = (f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
@@ -8284,7 +8284,7 @@ def run_web_wizard(args) -> None:
                             f'<a class="btn" href="/scans/{html_escape(name)}/files/">browse</a></td></tr>'
                         )
                 self._send_html(f"""<!doctype html><html><head><meta charset="utf-8">
-<title>jspect · previous scans</title>
+<title>Inspector-Javascript · previous scans</title>
 <style>
 body {{ font:13px -apple-system,sans-serif; background:#0f1115; color:#e6e8ec; margin:0; padding:24px; }}
 .container {{ max-width:880px; margin:0 auto; }}
@@ -8302,7 +8302,7 @@ a.home {{ color:#5eead4; text-decoration:none; font-size:12px; }}
 code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
 </style></head><body><div class="container">
 <a class="home" href="/">← new scan</a>
-<h1>📁 Previous scans <span style="color:#8b93a3;font-weight:normal;font-size:13px">— /tmp/jspect-web/</span></h1>
+<h1>📁 Previous scans <span style="color:#8b93a3;font-weight:normal;font-size:13px">— /tmp/ijs-web/</span></h1>
 <table><thead><tr><th>Target</th><th>When</th><th>Size</th><th>Actions</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 </div></body></html>""")
@@ -8328,9 +8328,9 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                     self._send_html("<h1>404</h1>", 404); return
                 dir_name = parts[2]
                 rest = parts[3]
-                base = (Path("/tmp/jspect-web") / dir_name).resolve()
+                base = (Path("/tmp/ijs-web") / dir_name).resolve()
                 try:
-                    base.relative_to(Path("/tmp/jspect-web").resolve())
+                    base.relative_to(Path("/tmp/ijs-web").resolve())
                 except ValueError:
                     self._send_html("403", 403); return
                 if not base.is_dir():
@@ -8628,7 +8628,7 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
             host = re.sub(r"[^a-zA-Z0-9.-]+", "-", host)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             output_dir = Path(custom_out) if custom_out else \
-                         Path("/tmp/jspect-web") / f"jspect-{host}-{ts}"
+                         Path("/tmp/ijs-web") / f"ijs-{host}-{ts}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
             # Register the job + spawn the subprocess
@@ -8677,7 +8677,7 @@ def main():
     print_banner()
 
     parser = HelpfulArgumentParser(
-        prog="jspect",
+        prog="ijs",
         description=(
             "Automated JavaScript security analysis pipeline.\n"
             "Pick a profile (--profile) for a one-shot scan, or run interactively "
@@ -8686,15 +8686,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  jspect -u https://target.com                            # default profile, AJAX spider on\n"
-            "  jspect -u https://target.com --profile gentle           # 1-thread, polite\n"
-            "  jspect -u https://target.com --profile full             # everything safe\n"
-            "  jspect -u https://target.com -H \"Cookie: session=abc\"   # authenticated\n"
-            "  jspect -u https://target.com --proxy http://127.0.0.1:8080  # route through Burp\n"
-            "  jspect --dir /path/to/source                            # local code review (no network)\n"
-            "  jspect -i                                               # terminal wizard\n"
-            "  jspect --serve                                          # web wizard at http://127.0.0.1:8765\n"
-            "  jspect --help-advanced                                  # show all expert flags\n"
+            "  ijs -u https://target.com                            # default profile, AJAX spider on\n"
+            "  ijs -u https://target.com --profile gentle           # 1-thread, polite\n"
+            "  ijs -u https://target.com --profile full             # everything safe\n"
+            "  ijs -u https://target.com -H \"Cookie: session=abc\"   # authenticated\n"
+            "  ijs -u https://target.com --proxy http://127.0.0.1:8080  # route through Burp\n"
+            "  ijs --dir /path/to/source                            # local code review (no network)\n"
+            "  ijs -i                                               # terminal wizard\n"
+            "  ijs --serve                                          # web wizard at http://127.0.0.1:8765\n"
+            "  ijs --help-advanced                                  # show all expert flags\n"
         ),
     )
 
@@ -8923,14 +8923,14 @@ def main():
         host = urlparse(args.url).hostname or "target"
     else:
         # Generic folder names ("output", "src", "dist") say nothing on their
-        # own — prefix the parent: jspect-myproject-dist-<ts>
+        # own — prefix the parent: ijs-myproject-dist-<ts>
         d = Path(args.dir).resolve()
         host = d.name or "local"
         if host.lower() in _GENERIC_DIR_NAMES and d.parent.name:
             host = f"{d.parent.name}-{host}"
         host = re.sub(r"[^\w.-]+", "_", host)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = Path(args.output) if args.output else Path(f"jspect-{host}-{timestamp}")
+    output_dir = Path(args.output) if args.output else Path(f"ijs-{host}-{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     Log.info(f"\nOutput: {output_dir}")
     Log.verbose(f"absolute: {output_dir.resolve()}")
