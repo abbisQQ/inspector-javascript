@@ -66,15 +66,15 @@ ENV SEMGREP_SEND_METRICS=off
 ENV JSPECT_DOCKER=1
 
 # ── Tool ──────────────────────────────────────────────────────────────────────
-WORKDIR /ijs
-COPY ijs.py .
+WORKDIR /inspector-js
+COPY inspector-js.py .
 
 # Reports are written to /output. Mount a host directory here:
-#   docker run --rm -v $(pwd)/out:/output ijs -u https://target.com
+#   docker run --rm -v $(pwd)/out:/output inspector-js -u https://target.com
 # To analyse a local source tree, also mount it read-only:
 #   docker run --rm -v $(pwd)/out:/output -v /path/to/src:/target:ro \
-#              ijs --dir /target -u https://target.com
+#              inspector-js --dir /target -u https://target.com
 VOLUME ["/output"]
 WORKDIR /output
 
-ENTRYPOINT ["python3", "/ijs/ijs.py"]
+ENTRYPOINT ["python3", "/inspector-js/inspector-js.py"]

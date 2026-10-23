@@ -1,6 +1,6 @@
 #!/opt/homebrew/bin/python3.11
 """
-ijs.py — Automated JavaScript analysis pipeline for web app pentesting.
+inspector-js.py — Automated JavaScript analysis pipeline for web app pentesting.
 
 Two operating modes:
   URL mode  (-u)    Crawl a live target, download its JS, then analyse it.
@@ -26,12 +26,12 @@ Pipeline stages:
   9    HTML report                   — dark-themed, collapsible, self-contained
 
 Usage:
-  ./ijs.py -u https://target.com
-  ./ijs.py -u https://target.com -H "Cookie: session=abc123"
-  ./ijs.py -u https://target.com -H "Authorization: Bearer eyJ..." -d 6
-  ./ijs.py -u https://target.com --verify-secrets       # ROE permitting
-  ./ijs.py --dir /path/to/NodeGoat                      # local source analysis
-  ./ijs.py --dir /path/to/NodeGoat -u http://localhost:4000  # combined
+  ./inspector-js.py -u https://target.com
+  ./inspector-js.py -u https://target.com -H "Cookie: session=abc123"
+  ./inspector-js.py -u https://target.com -H "Authorization: Bearer eyJ..." -d 6
+  ./inspector-js.py -u https://target.com --verify-secrets       # ROE permitting
+  ./inspector-js.py --dir /path/to/NodeGoat                      # local source analysis
+  ./inspector-js.py --dir /path/to/NodeGoat -u http://localhost:4000  # combined
 """
 
 import argparse
@@ -521,7 +521,7 @@ def parse_headers(headers):
         if ":" in h:
             k, v = h.split(":", 1)
             out[k.strip()] = v.strip()
-    out.setdefault("User-Agent", "Mozilla/5.0 ijs/1.0")
+    out.setdefault("User-Agent", "Mozilla/5.0 inspector-js/1.0")
     return out
 
 
@@ -556,7 +556,7 @@ def fetch_url(url, headers=None, timeout=15, max_bytes=None):
 
 def _random_probe_path() -> str:
     """A path that almost certainly doesn't exist, for soft-404 baselining."""
-    return "/" + hashlib.sha1(os.urandom(16)).hexdigest()[:24] + "/ijs-probe-404"
+    return "/" + hashlib.sha1(os.urandom(16)).hexdigest()[:24] + "/inspector-js-probe-404"
 
 
 def soft404_signatures(probe_fn, base_url: str, n: int = 3) -> set:
@@ -905,16 +905,16 @@ _DESTRUCTIVE_TEXT_RE = re.compile(
 # admin) can immediately tell it came from an automated tool.
 def _spider_fake_value(input_type: str, name: str) -> str:
     """Return a recognisably-fake value to type into a form field.
-    Uses obvious markers (`ijs-test+`, `Lorem ipsum ijs scan`) so the
+    Uses obvious markers (`inspector-js-test+`, `Lorem ipsum inspector-js scan`) so the
     recipient can tell it came from an automated scanner.
     """
     name_l = (name or "").lower()
     rand_suffix = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
     if input_type in ("email",) or "email" in name_l or "mail" in name_l:
-        return f"ijs-test+{rand_suffix}@example.com"
+        return f"inspector-js-test+{rand_suffix}@example.com"
     if input_type in ("url",) or "url" in name_l or "website" in name_l:
-        return "https://example.com/ijs-test"
+        return "https://example.com/inspector-js-test"
     if input_type == "tel" or "phone" in name_l or "mobile" in name_l:
         return "+15555550100"   # 555-01xx is non-dialable reserved range
     if input_type == "number":
@@ -922,9 +922,9 @@ def _spider_fake_value(input_type: str, name: str) -> str:
     if input_type == "date":
         return "2026-01-01"
     if input_type == "search":
-        return "ijs"
+        return "inspector-js"
     # Default: free text. Make sure it's obviously a test.
-    return "Lorem ipsum ijs scan test"
+    return "Lorem ipsum inspector-js scan test"
 
 
 # Form-fill modes: how aggressive the spider is with <form> elements.
@@ -1512,7 +1512,7 @@ def ajax_spider(target: str,
                 extra_http_headers={k: v for k, v in header_dict.items()
                                     if k.lower() != "user-agent"},
                 user_agent=header_dict.get("User-Agent",
-                                            "Mozilla/5.0 ijs/1.0"),
+                                            "Mozilla/5.0 inspector-js/1.0"),
             )
 
             for page_url in page_urls:
@@ -2972,7 +2972,7 @@ def _is_openapi_doc(data) -> bool:
 
 
 def extract_openapi_endpoints(data: dict, source_url: str) -> list:
-    """Turn a parsed Swagger/OpenAPI doc into ijs endpoint records. Purely
+    """Turn a parsed Swagger/OpenAPI doc into inspector-js endpoint records. Purely
     structural — no per-target or per-vendor assumptions. Shared by the static
     JSON analysis and the live runtime-config discovery stage."""
     out = []
@@ -3410,7 +3410,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
     ctx = permissive_ssl_context()
 
     try:
-        req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
+        req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT, context=ctx) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         cdx_rows: list[list[str]] = json.loads(raw)
@@ -3449,7 +3449,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
         # Download the archived copy regardless — it may differ from the live version
         wb_url = _WB_FETCH.format(timestamp=timestamp, url=orig_url)
         try:
-            req2 = urllib.request.Request(wb_url, headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
+            req2 = urllib.request.Request(wb_url, headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
             with urllib.request.urlopen(req2, timeout=_WB_DL_TIMEOUT, context=ctx) as resp2:
                 wb_status  = resp2.getcode()
                 wb_body    = resp2.read().decode("utf-8", errors="replace")
@@ -3606,7 +3606,7 @@ def _google_cse_search(query: str, api_key: str, cse_id: str,
         )
         try:
             req = urllib.request.Request(api_url,
-                headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
+                headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
             with urllib.request.urlopen(req, timeout=15,
                                         context=permissive_ssl_context()) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
@@ -3637,7 +3637,7 @@ def _query_cdx_for_ext(domain: str, ext: str, limit: int = 200) -> list[tuple[st
     url = _CDX_API + "?" + _up.urlencode(params)
     try:
         req = urllib.request.Request(url,
-            headers={"User-Agent": "Mozilla/5.0 ijs/1.0"})
+            headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT,
                                     context=permissive_ssl_context()) as resp:
             rows = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -4648,7 +4648,7 @@ def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoi
 
     # ── Fetch + analyse ─────────────────────────────────────────────────────
     findings = []            # [{url, source, type, sensitive_keys, extracted_urls, secrets}]
-    new_endpoints = []       # ijs endpoint records to feed back into probing
+    new_endpoints = []       # inspector-js endpoint records to feed back into probing
     config_secrets = []      # [{kind, match, file, source}]
     seen_secret = set()
     fetched = soft_skipped = 0
@@ -5571,8 +5571,8 @@ rules:
 # contents are appended to the defaults at scan time. The file format is just
 # a Semgrep `rules:` document; everything Semgrep accepts works.
 #   View / edit / save / reset from the web wizard at /rules
-#   Or `ijs --rules-path` to print the path + edit manually.
-USER_RULES_PATH = Path.home() / ".config" / "ijs" / "rules.yaml"
+#   Or `inspector-js --rules-path` to print the path + edit manually.
+USER_RULES_PATH = Path.home() / ".config" / "inspector-js" / "rules.yaml"
 
 
 def get_effective_rules() -> str:
@@ -6288,7 +6288,7 @@ def generate_report(target, output_dir, results):
                                      results.get("secrets_ext_count", 0)) else ""
 
     parts.append("<nav>")
-    parts.append("<span class='nav-brand'>🔍 ijs</span>")
+    parts.append("<span class='nav-brand'>🔍 Inspector-Javascript</span>")
     parts.append("<div class='nav-links'>")
     # Minimalism: skip nav links to sections that won't render any content.
     # Each tuple is (href, label, css class, should-show predicate).
@@ -7422,8 +7422,8 @@ def generate_report(target, output_dir, results):
 
     # ── Footer ───────────────────────────────────────────────────────
     parts.append(
-        f"<footer>Generated by <a href='https://github.com/abbisQQ/ijs' "
-        f"style='color:inherit;text-decoration:underline'>ijs</a> · "
+        f"<footer>Generated by <a href='https://github.com/abbisQQ/inspector-js' "
+        f"style='color:inherit;text-decoration:underline'>Inspector-Javascript</a> · "
         f"{html_escape(now)}<br>"
         f"<span style='font-size:10px;color:var(--text-dim)'>"
         f"Powered by Katana · JSluice · Semgrep · Retire.js · TruffleHog · "
@@ -7542,7 +7542,7 @@ def _wiz_ask_headers() -> list:
 def _wiz_equivalent_cli(args) -> str:
     """Build the CLI you'd type to repeat this scan without the wizard."""
     q = shlex.quote
-    parts = ["ijs"]
+    parts = ["inspector-js"]
     if args.url:
         parts.append(f"-u {q(args.url)}")
     if args.dir:
@@ -8026,7 +8026,7 @@ WEB_LOG_QUEUE_MAX      = 10_000     # cap per-job log queue (drops oldest entrie
 WEB_CANCEL_GRACE_S     = 3          # SIGTERM grace before SIGKILL on /cancel
 WEB_SSE_KEEPALIVE_S    = 30         # idle ping interval on /events/<id>
 WEB_JOB_ID_BYTES       = 8          # bytes of entropy in secrets.token_urlsafe()
-WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/ijs-web")   # where /scans listing reads from
+WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/inspector-js-web")   # where /scans listing reads from
 
 
 # ── /rules page template ─────────────────────────────────────────────────────
@@ -8163,7 +8163,7 @@ def _web_guess_content_type(suffix: str) -> str:
 
 
 def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> None:
-    """Run ijs again as a subprocess so its stdout streams cleanly per-job.
+    """Run inspector-js again as a subprocess so its stdout streams cleanly per-job.
     Pushes each output line into the job's Queue for SSE consumption."""
     import subprocess as _subprocess
     cmd = [sys.executable, __file__]
@@ -8246,21 +8246,21 @@ def run_web_wizard(args) -> None:
                 return
 
             # ── /scans — list every past scan directory on disk ──────────────
-            # Each entry is a directory under /tmp/ijs-web/ (the default
+            # Each entry is a directory under /tmp/inspector-js-web/ (the default
             # output location for web jobs). Clicking one lands you on the
             # same /files/ tree the live progress page links to, AND on the
             # report if present. Survives server restarts.
             if self.path == "/scans" or self.path == "/scans/":
-                web_root = Path("/tmp/ijs-web")
+                web_root = Path("/tmp/inspector-js-web")
                 scans = []
                 if web_root.is_dir():
                     for d in sorted(web_root.iterdir(),
                                      key=lambda p: p.stat().st_mtime, reverse=True):
                         if not d.is_dir():
                             continue
-                        # Parse "ijs-<host>-<YYYYMMDD>-<HHMMSS>" → host + ts
-                        # (also match the legacy "ijs-" prefix so old scans still list)
-                        m = re.match(r"(?:ijs|jspect)-(.+)-(\d{8}-\d{6})$", d.name)
+                        # Parse "inspector-js-<host>-<YYYYMMDD>-<HHMMSS>" → host + ts
+                        # (also match the legacy "inspector-js-" prefix so old scans still list)
+                        m = re.match(r"(?:inspector-js|jspect)-(.+)-(\d{8}-\d{6})$", d.name)
                         host = m.group(1) if m else d.name
                         ts   = m.group(2) if m else ""
                         size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
@@ -8268,7 +8268,7 @@ def run_web_wizard(args) -> None:
                         scans.append((d.name, host, ts, size, has_report))
                 rows = []
                 if not scans:
-                    rows.append('<tr><td colspan="4" class="empty">No past scans in /tmp/ijs-web/</td></tr>')
+                    rows.append('<tr><td colspan="4" class="empty">No past scans in /tmp/inspector-js-web/</td></tr>')
                 else:
                     for name, host, ts, size, has_report in scans:
                         ts_fmt = (f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
@@ -8302,7 +8302,7 @@ a.home {{ color:#5eead4; text-decoration:none; font-size:12px; }}
 code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
 </style></head><body><div class="container">
 <a class="home" href="/">← new scan</a>
-<h1>📁 Previous scans <span style="color:#8b93a3;font-weight:normal;font-size:13px">— /tmp/ijs-web/</span></h1>
+<h1>📁 Previous scans <span style="color:#8b93a3;font-weight:normal;font-size:13px">— /tmp/inspector-js-web/</span></h1>
 <table><thead><tr><th>Target</th><th>When</th><th>Size</th><th>Actions</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
 </div></body></html>""")
@@ -8328,9 +8328,9 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                     self._send_html("<h1>404</h1>", 404); return
                 dir_name = parts[2]
                 rest = parts[3]
-                base = (Path("/tmp/ijs-web") / dir_name).resolve()
+                base = (Path("/tmp/inspector-js-web") / dir_name).resolve()
                 try:
-                    base.relative_to(Path("/tmp/ijs-web").resolve())
+                    base.relative_to(Path("/tmp/inspector-js-web").resolve())
                 except ValueError:
                     self._send_html("403", 403); return
                 if not base.is_dir():
@@ -8628,7 +8628,7 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
             host = re.sub(r"[^a-zA-Z0-9.-]+", "-", host)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             output_dir = Path(custom_out) if custom_out else \
-                         Path("/tmp/ijs-web") / f"ijs-{host}-{ts}"
+                         Path("/tmp/inspector-js-web") / f"inspector-js-{host}-{ts}"
             output_dir.mkdir(parents=True, exist_ok=True)
 
             # Register the job + spawn the subprocess
@@ -8677,7 +8677,7 @@ def main():
     print_banner()
 
     parser = HelpfulArgumentParser(
-        prog="ijs",
+        prog="inspector-js",
         description=(
             "Automated JavaScript security analysis pipeline.\n"
             "Pick a profile (--profile) for a one-shot scan, or run interactively "
@@ -8686,15 +8686,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  ijs -u https://target.com                            # default profile, AJAX spider on\n"
-            "  ijs -u https://target.com --profile gentle           # 1-thread, polite\n"
-            "  ijs -u https://target.com --profile full             # everything safe\n"
-            "  ijs -u https://target.com -H \"Cookie: session=abc\"   # authenticated\n"
-            "  ijs -u https://target.com --proxy http://127.0.0.1:8080  # route through Burp\n"
-            "  ijs --dir /path/to/source                            # local code review (no network)\n"
-            "  ijs -i                                               # terminal wizard\n"
-            "  ijs --serve                                          # web wizard at http://127.0.0.1:8765\n"
-            "  ijs --help-advanced                                  # show all expert flags\n"
+            "  inspector-js -u https://target.com                            # default profile, AJAX spider on\n"
+            "  inspector-js -u https://target.com --profile gentle           # 1-thread, polite\n"
+            "  inspector-js -u https://target.com --profile full             # everything safe\n"
+            "  inspector-js -u https://target.com -H \"Cookie: session=abc\"   # authenticated\n"
+            "  inspector-js -u https://target.com --proxy http://127.0.0.1:8080  # route through Burp\n"
+            "  inspector-js --dir /path/to/source                            # local code review (no network)\n"
+            "  inspector-js -i                                               # terminal wizard\n"
+            "  inspector-js --serve                                          # web wizard at http://127.0.0.1:8765\n"
+            "  inspector-js --help-advanced                                  # show all expert flags\n"
         ),
     )
 
@@ -8923,14 +8923,14 @@ def main():
         host = urlparse(args.url).hostname or "target"
     else:
         # Generic folder names ("output", "src", "dist") say nothing on their
-        # own — prefix the parent: ijs-myproject-dist-<ts>
+        # own — prefix the parent: inspector-js-myproject-dist-<ts>
         d = Path(args.dir).resolve()
         host = d.name or "local"
         if host.lower() in _GENERIC_DIR_NAMES and d.parent.name:
             host = f"{d.parent.name}-{host}"
         host = re.sub(r"[^\w.-]+", "_", host)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = Path(args.output) if args.output else Path(f"ijs-{host}-{timestamp}")
+    output_dir = Path(args.output) if args.output else Path(f"inspector-js-{host}-{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
     Log.info(f"\nOutput: {output_dir}")
     Log.verbose(f"absolute: {output_dir.resolve()}")

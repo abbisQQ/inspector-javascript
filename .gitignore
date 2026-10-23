@@ -21,8 +21,8 @@ Thumbs.db
 .idea/
 .vscode/
 
-# ── Tool run outputs (auto-timestamped ijs-* directories) ───────────────────
-ijs-*/
+# ── Tool run outputs (auto-timestamped inspector-js-* directories) ───────────────────
+inspector-js-*/
 jspect-*/
 report-*/
 output/
