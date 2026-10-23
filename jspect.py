@@ -101,6 +101,7 @@ TRUFFLEHOG_TIMEOUT       = 300   # seconds
 
 # Live endpoint validation
 MAX_ENDPOINTS_TO_VALIDATE = 500  # cap to avoid probing thousands of generated URLs
+MAX_CONFIG_BYTES = 2 * 1024 * 1024  # cap on a single fetched runtime-config body
 
 # Source-map tooling
 UNWEBPACK_TIMEOUT        = 60    # seconds for unwebpack
@@ -2963,6 +2964,55 @@ SENSITIVE_JSON_KEYS = re.compile(
 _JS_JSON_WRAPPER_RE = re.compile(r"^\s*(?:module\.exports\s*=|export\s+default)\s*")
 
 
+def _is_openapi_doc(data) -> bool:
+    """Format-driven: a Swagger/OpenAPI doc regardless of source or vendor."""
+    return isinstance(data, dict) and bool(
+        data.get("swagger") or data.get("openapi")
+        or ("paths" in data and isinstance(data.get("paths"), dict))
+    )
+
+
+def extract_openapi_endpoints(data: dict, source_url: str) -> list:
+    """Turn a parsed Swagger/OpenAPI doc into jspect endpoint records. Purely
+    structural — no per-target or per-vendor assumptions. Shared by the static
+    JSON analysis and the live runtime-config discovery stage."""
+    out = []
+    base = ""
+    # OpenAPI 3 servers[].url / Swagger 2 basePath — prefix so paths resolve.
+    servers = data.get("servers")
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        base = (servers[0].get("url") or "").rstrip("/")
+    elif data.get("basePath"):
+        base = str(data.get("basePath")).rstrip("/")
+    for path, methods in (data.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, spec in methods.items():
+            if method.upper() not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+                continue
+            query_params, body_params = [], []
+            if isinstance(spec, dict):
+                for param in spec.get("parameters", []) or []:
+                    if not isinstance(param, dict):
+                        continue
+                    if param.get("in") == "query":
+                        query_params.append(param.get("name", ""))
+                    elif param.get("in") == "body":
+                        body_params.append(param.get("name", "body"))
+                if spec.get("requestBody"):
+                    body_params.append("body")
+            full_path = f"{base}{path}" if base and str(path).startswith("/") else path
+            out.append({
+                "url": full_path,
+                "method": method.upper(),
+                "queryParams": [p for p in query_params if p],
+                "bodyParams": [p for p in body_params if p],
+                "type": "swagger" if data.get("swagger") else "openapi",
+                "filename": source_url,
+            })
+    return out
+
+
 def _unwrap_js_json(text: str) -> str:
     """Webpack's json-loader output (recovered from source maps) is
     `module.exports = {...}` rather than plain JSON — strip the wrapper."""
@@ -3207,38 +3257,11 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
                    "sensitive_keys": [], "size": len(body)}
 
         # Swagger / OpenAPI detection
-        if isinstance(data, dict) and (
-            data.get("swagger") or data.get("openapi")
-            or ("paths" in data and isinstance(data.get("paths"), dict))
-        ):
+        if _is_openapi_doc(data):
             finding["type"] = "swagger" if data.get("swagger") else "openapi"
-            paths = data.get("paths", {})
-            for path, methods in paths.items():
-                if not isinstance(methods, dict):
-                    continue
-                for method, spec in methods.items():
-                    if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
-                        body_params = []
-                        query_params = []
-                        if isinstance(spec, dict):
-                            for param in spec.get("parameters", []) or []:
-                                if not isinstance(param, dict):
-                                    continue
-                                if param.get("in") == "query":
-                                    query_params.append(param.get("name", ""))
-                                elif param.get("in") == "body":
-                                    body_params.append(param.get("name", "body"))
-                            if spec.get("requestBody"):
-                                body_params.append("body")
-                        swagger_endpoints.append({
-                            "url": path,
-                            "method": method.upper(),
-                            "queryParams": [p for p in query_params if p],
-                            "bodyParams": [p for p in body_params if p],
-                            "type": "swagger",
-                            "filename": url,
-                        })
-            Log.debug(f"swagger doc at {url}: {len(paths)} paths extracted")
+            eps = extract_openapi_endpoints(data, url)
+            swagger_endpoints.extend(eps)
+            Log.debug(f"swagger doc at {url}: {len(eps)} endpoint(s) extracted")
 
         # Sensitive keys scan
         found_keys = sorted({m.group(1).lower() for m in SENSITIVE_JSON_KEYS.finditer(body)})
@@ -4511,6 +4534,229 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
         Log.info("    [-] No extended secret patterns matched")
 
     return http_file, secrets_file
+
+
+# ---------- Stage 5e: Runtime config discovery ----------
+
+# Generic, convention-based config filenames (NOT target-specific) — the same
+# spirit as the well-known path list. These supplement whatever the target's own
+# JS references. Each is tried at the site root and under common asset dirs.
+_CONFIG_CONVENTION_NAMES = [
+    "config.json", "app.config.json", "appsettings.json", "appconfig.json",
+    "application.json", "env.json", "environment.json", "runtime-config.json",
+    "runtime.json", "settings.json", "configuration.json",
+    "manifest.json", "asset-manifest.json",
+]
+_CONFIG_CONVENTION_DIRS = ["", "/assets", "/assets/config", "/config", "/static", "/static/config"]
+
+# URL-shaped values inside a config blob: absolute URLs or rooted API paths.
+_CONFIG_URL_RE = re.compile(r"""["'`](https?://[^\s"'`<>]{4,}|/(?:api|rest|graphql|v\d|oauth|auth|services?|gateway)[^\s"'`<>]*)["'`]""",
+                            re.IGNORECASE)
+
+
+def _resolve_referenced_url(raw: str, target_base: str, target_host: str):
+    """Resolve a URL extracted from JS into an absolute, same-origin URL to GET.
+    Leading base-URL placeholders (`${...}`/`EXPR`) are replaced with the target
+    origin; a placeholder anywhere else means we can't know the path → skip.
+    Returns None when it can't be resolved safely or is out of scope."""
+    raw = (raw or "").strip().strip("'\"`")
+    if not raw:
+        return None
+    # Strip a leading base-URL placeholder: "${env.api}/assets/x.json" -> "/assets/x.json"
+    raw = re.sub(r"^(?:\$\{[^}]*\}|EXPR)(?=/)", "", raw)
+    raw = raw.replace("`", "")
+    if "${" in raw or "EXPR" in raw:
+        return None   # unresolved placeholder mid-path — don't guess
+    if raw.startswith(("http://", "https://")):
+        full = raw
+    elif raw.startswith("//"):
+        full = "https:" + raw
+    elif raw.startswith("/"):
+        full = target_base + raw
+    else:
+        full = target_base + "/" + raw
+    full = full.split("#")[0]
+    if not host_in_scope(full, target_host):
+        return None
+    return full
+
+
+def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoints_file):
+    """Stage 5e — fetch and analyse the JSON config an SPA loads at runtime.
+
+    Generic by construction: candidate URLs come from (a) the target's own JS
+    (http-calls.json) and (b) a small convention list; nothing target-specific.
+    Every fetch is checked against the catch-all signature so an SPA that answers
+    index.html for unknown paths can't be mistaken for config. For each real JSON
+    body we extract API base URLs / endpoints, parse embedded Swagger/OpenAPI,
+    and run the secret patterns."""
+    stage_header("5e", "Runtime config discovery (fetch + analyse app config)")
+
+    target_parsed = urlparse(target)
+    target_host = target_parsed.hostname or ""
+    target_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
+    header_dict = parse_headers(headers)
+    ctx = permissive_ssl_context()
+
+    # A probe_fn compatible with soft404_signatures/is_soft404.
+    def probe(url, method="GET"):
+        try:
+            req = urllib.request.Request(url, headers=header_dict, method=method)
+            with urllib.request.urlopen(req, context=ctx, timeout=ENDPOINT_CHECK_TIMEOUT) as resp:
+                ct = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip()
+                cl = resp.headers.get("Content-Length", "")
+                body = resp.read(MAX_CONFIG_BYTES)
+                size = int(cl) if cl.isdigit() else len(body)
+                return {"url": url, "status": resp.status, "size": size,
+                        "content_type": ct, "body": body}
+        except urllib.error.HTTPError as e:
+            return {"url": url, "status": e.code, "size": None, "content_type": "", "body": b""}
+        except Exception as e:
+            Log.debug(f"config probe {url[:70]} failed: {type(e).__name__}")
+            return {"url": url, "status": None, "size": None, "content_type": "", "body": b""}
+
+    # Reuse the catch-all signature learned by Stage 5, else learn one now.
+    signatures = set()
+    meta_path = output_dir / "live-endpoints-meta.json"
+    if meta_path.exists():
+        try:
+            sig = (json.loads(meta_path.read_text()) or {}).get("catch_all_signature")
+            if sig:
+                signatures = {(sig["status"], sig["size"], sig["content_type"])}
+        except Exception:
+            pass
+    if not signatures:
+        signatures = soft404_signatures(probe, target_base)
+
+    # ── Candidate URLs ──────────────────────────────────────────────────────
+    candidates = {}   # url -> source ("referenced" | "convention")
+    # (a) JSON/config URLs the app's own code fetches
+    for call in parse_jsonl(http_calls_file):
+        raw = call.get("url") or ""
+        low = raw.lower()
+        if ".json" not in low and not any(w in low for w in ("config", "settings", "/env", "manifest")):
+            continue
+        full = _resolve_referenced_url(raw, target_base, target_host)
+        if full:
+            candidates.setdefault(full, "referenced")
+    # (b) small generic convention list
+    for d in _CONFIG_CONVENTION_DIRS:
+        for name in _CONFIG_CONVENTION_NAMES:
+            candidates.setdefault(f"{target_base}{d}/{name}", "convention")
+
+    Log.verbose(f"runtime-config candidates: {len(candidates)} "
+                f"({sum(1 for v in candidates.values() if v=='referenced')} referenced)")
+
+    # ── Fetch + analyse ─────────────────────────────────────────────────────
+    findings = []            # [{url, source, type, sensitive_keys, extracted_urls, secrets}]
+    new_endpoints = []       # jspect endpoint records to feed back into probing
+    config_secrets = []      # [{kind, match, file, source}]
+    seen_secret = set()
+    fetched = soft_skipped = 0
+
+    for url, source in sorted(candidates.items()):
+        r = probe(url)
+        if r.get("status") != 200:
+            continue
+        if is_soft404(r, signatures):
+            soft_skipped += 1
+            continue
+        body_bytes = r.get("body") or b""
+        text = _unwrap_js_json(body_bytes.decode("utf-8", errors="replace")).strip()
+        if not text.startswith(("{", "[")):
+            continue   # not JSON — e.g. a catch-all HTML page without a matching signature
+        try:
+            data = json.loads(text)
+        except Exception:
+            continue
+        fetched += 1
+        finding = {"url": url, "source": source, "type": "config",
+                   "size": r.get("size"), "sensitive_keys": [], "extracted_urls": 0}
+
+        # Swagger / OpenAPI → endpoints
+        if _is_openapi_doc(data):
+            finding["type"] = "swagger" if data.get("swagger") else "openapi"
+            eps = extract_openapi_endpoints(data, url)
+            new_endpoints.extend(eps)
+            finding["extracted_urls"] += len(eps)
+
+        # URL-shaped values anywhere in the blob → endpoints
+        for m in _CONFIG_URL_RE.finditer(text):
+            val = m.group(1)
+            if val.startswith("/") or host_in_scope(val, target_host):
+                new_endpoints.append({"url": val, "method": "", "queryParams": [],
+                                      "bodyParams": [], "type": "config-url", "filename": url})
+                finding["extracted_urls"] += 1
+
+        # Secret keys + full secret-pattern sweep on the config body
+        found_keys = sorted({mm.group(1).lower() for mm in SENSITIVE_JSON_KEYS.finditer(text)})
+        if found_keys:
+            finding["sensitive_keys"] = found_keys
+        for pattern, kind in _SECRET_PATTERNS:
+            for mm in pattern.finditer(text):
+                val = (mm.group(1) if mm.groups() else mm.group(0))[:80]
+                dedup = (kind, val)
+                if dedup in seen_secret:
+                    continue
+                seen_secret.add(dedup)
+                config_secrets.append({"kind": kind, "match": val, "file": url, "source": "runtime-config"})
+
+        findings.append(finding)
+
+    # ── Persist ─────────────────────────────────────────────────────────────
+    config_file = None
+    if findings:
+        config_file = output_dir / "runtime-config.json"
+        with config_file.open("w", encoding="utf-8") as f:
+            for x in findings:
+                f.write(json.dumps(x) + "\n")
+
+    # Feed discovered endpoints back into the main endpoints file (deduped).
+    added = 0
+    if new_endpoints and endpoints_file:
+        existing = set()
+        if Path(endpoints_file).exists():
+            for l in Path(endpoints_file).open(encoding="utf-8", errors="replace"):
+                try: existing.add(json.loads(l).get("url"))
+                except Exception: pass
+        with Path(endpoints_file).open("a", encoding="utf-8") as f:
+            for ep in new_endpoints:
+                if ep["url"] in existing:
+                    continue
+                existing.add(ep["url"])
+                f.write(json.dumps(ep) + "\n")
+                added += 1
+
+    secrets_file = None
+    if config_secrets:
+        secrets_file = output_dir / "config-secrets.json"
+        with secrets_file.open("w", encoding="utf-8") as f:
+            for s in config_secrets:
+                f.write(json.dumps(s) + "\n")
+
+    if not findings:
+        extra = f" ({soft_skipped} matched the catch-all page)" if soft_skipped else ""
+        Log.info(f"    [-] No runtime config files found{extra}")
+    else:
+        api_docs = sum(1 for x in findings if x["type"] in ("swagger", "openapi"))
+        Log.info(f"    {C.GREEN}[+]{C.RESET} {len(findings)} config file(s) fetched"
+                 + (f", {api_docs} API doc(s)" if api_docs else "")
+                 + (f", {added} new endpoint(s)" if added else "")
+                 + (f", {soft_skipped} catch-all skipped" if soft_skipped else ""))
+        if config_secrets:
+            Log.info(f"    {C.YELLOW}[!]{C.RESET} {len(config_secrets)} secret candidate(s) in config "
+                     f"— see config-secrets.json")
+        if added:
+            Log.info(f"    {C.DIM}↳ {added} endpoint(s) merged into endpoints.json for review{C.RESET}")
+
+    return {
+        "runtime_config_file": config_file,
+        "runtime_config_count": len(findings),
+        "runtime_config_endpoints": added,
+        "runtime_config_secrets_file": secrets_file,
+        "runtime_config_secrets_count": len(config_secrets),
+        "runtime_config_soft_skipped": soft_skipped,
+    }
 
 
 # ---------- Stage 6: Semgrep ----------
@@ -6548,6 +6794,40 @@ def generate_report(target, output_dir, results):
             parts.append("</tbody></table>")
             parts.append(end_sub())
     parts.append(end_section())
+
+    # ── Runtime config ───────────────────────────────────────────────
+    rc_findings = parse_jsonl(results.get("runtime_config_file"))
+    rc_secrets  = parse_jsonl(results.get("runtime_config_secrets_file"))
+    if rc_findings or rc_secrets:
+        rc_badge = "error" if rc_secrets else "success"
+        parts.append(section("runtime-config", "Runtime Config (fetched from app)",
+                             f"{len(rc_findings)} file(s)" + (f" · {len(rc_secrets)} secret(s)" if rc_secrets else ""),
+                             rc_badge, open_=True))
+        parts.append("<p class='empty'>JSON config the app loads at runtime, fetched live and "
+                     "verified against the catch-all signature. Often holds API base URLs, "
+                     "feature flags, client IDs, or keys.</p>")
+        if rc_findings:
+            parts.append("<table><thead><tr><th>URL</th><th>Source</th><th>Type</th>"
+                         "<th>Sensitive keys</th><th>Endpoints found</th></tr></thead><tbody>")
+            for x in rc_findings:
+                keys = ", ".join(x.get("sensitive_keys") or []) or "—"
+                parts.append(f"<tr><td><code>{html_escape(x.get('url',''))}</code>"
+                             f"{copy_btn(x.get('url',''))}</td>"
+                             f"<td><span class='badge neutral'>{html_escape(x.get('source','?'))}</span></td>"
+                             f"<td><code>{html_escape(x.get('type','?'))}</code></td>"
+                             f"<td><code>{html_escape(keys)}</code></td>"
+                             f"<td>{x.get('extracted_urls',0)}</td></tr>")
+            parts.append("</tbody></table>")
+        if rc_secrets:
+            parts.append(sub(f"Secrets in config ({len(rc_secrets)})", len(rc_secrets), "error", open_=True))
+            parts.append("<table><thead><tr><th>Kind</th><th>Value (truncated)</th><th>File</th></tr></thead><tbody>")
+            for s in rc_secrets:
+                parts.append(f"<tr><td><span class='badge error'>{html_escape(s.get('kind','?'))}</span></td>"
+                             f"<td><code>{html_escape(s.get('match',''))}</code></td>"
+                             f"<td><code>{html_escape(s.get('file',''))}</code></td></tr>")
+            parts.append("</tbody></table>")
+            parts.append(end_sub())
+        parts.append(end_section())
 
     # ── HTTP Calls ───────────────────────────────────────────────────
     http_calls = parse_jsonl(results.get("http_calls_file"))
@@ -8932,6 +9212,16 @@ def main():
         results["http_calls_count"] = count_nonempty_lines(http_calls_file)
     if secrets_ext_file:
         results["secrets_ext_count"] = count_nonempty_lines(secrets_ext_file)
+
+    # Stage 5e — Runtime config discovery (URL mode only — needs a live host).
+    # Fetches the JSON config the app loads at runtime and feeds any API docs /
+    # base URLs it finds back into the endpoint list.
+    if args.url:
+        rc = discover_runtime_config(args.url, output_dir, args.header,
+                                     http_calls_file, endpoints)
+        results.update(rc)
+        if rc.get("runtime_config_endpoints"):
+            results["endpoint_count"] = count_nonempty_lines(endpoints)
 
     # Stage 6 — Semgrep
     semgrep_file = run_semgrep(analysis_target, output_dir, available)
