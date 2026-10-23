@@ -308,5 +308,28 @@ class FrameworkRouteTests(unittest.TestCase):
                          (None, set()))
 
 
+class RouteMutationTests(unittest.TestCase):
+    def test_generates_parents_siblings_and_wordlist(self):
+        muts = ijs.generate_route_mutations(["/api/v1/users/42", "/api/v1/orders"])
+        # parents
+        self.assertIn("/api/v1/users", muts)
+        self.assertIn("/api/v1", muts)
+        self.assertIn("/api", muts)
+        # wordlist under a prefix and under a collection
+        self.assertIn("/api/v1/health", muts)
+        self.assertIn("/api/v1/orders/count", muts)
+        # singular/plural
+        self.assertIn("/api/v1/user", muts)
+
+    def test_excludes_dynamic_segments_and_known(self):
+        muts = ijs.generate_route_mutations(["/api/users/[id]", "/x/:slug", "/y/EXPR", "/health"])
+        self.assertFalse(any(tok in m for m in muts for tok in ("[", ":", "EXPR")))
+        self.assertNotIn("/health", muts)   # a seed itself is never echoed back
+
+    def test_cap_is_respected(self):
+        seeds = [f"/api/resource{i}/item" for i in range(50)]
+        self.assertLessEqual(len(ijs.generate_route_mutations(seeds, cap=120)), 120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

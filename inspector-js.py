@@ -22,6 +22,7 @@ Pipeline stages:
   5c   HTTP call + secret extraction — fetch/axios/XHR/Express routes, JWT/AWS/key patterns
   5d   Wayback maps                  — historically captured .js.map files (CDX API)
   5e   Runtime config discovery      — fetch the JSON config the app loads at runtime
+  5f   Route mutation (opt-in)       — probe sibling/unreferenced routes from naming conventions
   6    Semgrep SAST                  — DOM sinks, eval, open redirect, cookie misconfig
   7    Retire.js                     — known-vulnerable library fingerprinting
   8    TruffleHog                    — secret/credential detection
@@ -2982,6 +2983,149 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
                                (next(iter(catch_all))) if catch_all else None,
     }))
     return output_file
+
+
+# ---------- Stage 5f: Route mutation (opt-in sibling/unreferenced discovery) ----------
+
+# High-value API/ops words to try under observed path prefixes.
+_ROUTE_MUTATION_WORDLIST = [
+    "health", "status", "healthz", "readyz", "livez", "ping", "version", "info",
+    "metrics", "debug", "config", "env", "settings", "actuator",
+    "users", "user", "admin", "accounts", "account", "auth", "login", "logout",
+    "register", "me", "profile", "session", "token", "refresh", "roles",
+    "permissions", "search", "export", "import", "list", "count", "all", "ids",
+    "swagger", "api-docs", "openapi", "graphql", "docs", "spec",
+]
+ROUTE_MUTATION_CAP = 300   # max candidate routes generated
+
+
+def generate_route_mutations(known_paths, cap: int = ROUTE_MUTATION_CAP) -> set:
+    """Derive sibling / parent / unreferenced route candidates from the paths we
+    actually observed — the useful core of API content-discovery, driven by the
+    target's own naming conventions (no external wordlist tool). Dynamic
+    segments (/[id], /:id, EXPR) are skipped since they can't be probed as-is."""
+    known = {p.split("?")[0].rstrip("/") or "/" for p in known_paths}
+    prefixes, last_segs = set(), set()
+    muts = set()
+
+    for p in known:
+        if any(tok in p for tok in ("EXPR", "[", "]", ":")):
+            continue
+        segs = [s for s in p.split("/") if s]
+        if not segs:
+            continue
+        # Parent paths: /a/b/c -> /a/b, /a
+        for i in range(1, len(segs)):
+            muts.add("/" + "/".join(segs[:i]))
+        prefixes.add("/" + "/".join(segs[:-1]) if len(segs) > 1 else "")   # parent dir
+        prefixes.add("/" + "/".join(segs))                                 # full path (collection sub-actions)
+        last_segs.add(segs[-1])
+
+    for pre in prefixes:
+        # Curated wordlist under each observed prefix
+        for w in _ROUTE_MUTATION_WORDLIST:
+            muts.add(f"{pre}/{w}")
+        # Cross-pollinate observed last segments + singular/plural variants
+        for seg in last_segs:
+            muts.add(f"{pre}/{seg}")
+            muts.add(f"{pre}/{seg[:-1]}" if seg.endswith("s") else f"{pre}/{seg}s")
+
+    muts = {m for m in muts
+            if m and m not in known and not any(t in m for t in ("EXPR", "[", ":"))}
+    return set(sorted(muts)[:cap])
+
+
+def discover_route_mutations(target, endpoints_file, output_dir, headers):
+    """Stage 5f (opt-in) — probe sibling/unreferenced routes derived from the
+    endpoints we found. Scope-gated, soft-404-aware, capped. Reports only hits
+    that are distinct from the catch-all page."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    stage_header("5f", "Route mutation (sibling / unreferenced discovery)")
+
+    target_parsed = urlparse(target)
+    target_host = target_parsed.hostname or ""
+    target_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
+
+    # Seed from real hits (live-endpoints) + extracted endpoints, in scope only.
+    seeds = set()
+    live_file = output_dir / "live-endpoints.json"
+    for src in (live_file, endpoints_file):
+        for rec in parse_jsonl(src):
+            u = (rec.get("url") or "").strip()
+            if not u:
+                continue
+            path = urlparse(u).path if u.startswith(("http://", "https://")) else u.split("?")[0]
+            if path.startswith("/") and is_in_scope(u, target_host):
+                seeds.add(path)
+    if not seeds:
+        Log.info("    [-] No in-scope seed routes to mutate from")
+        return {"mutated_routes_file": None, "mutated_routes_count": 0}
+
+    candidates = generate_route_mutations(seeds)
+    Log.info(f"    {C.GREEN}[+]{C.RESET} {len(candidates)} candidate(s) from {len(seeds)} seed route(s)")
+
+    header_dict = parse_headers(headers)
+    ctx = permissive_ssl_context()
+    title_re = re.compile(rb"<title[^>]*>([^<]+)</title>", re.IGNORECASE)
+
+    def check(url):
+        try:
+            req = urllib.request.Request(url, headers=header_dict, method="GET")
+            with urllib.request.urlopen(req, context=ctx, timeout=ENDPOINT_CHECK_TIMEOUT) as resp:
+                ct = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip()
+                cl = resp.headers.get("Content-Length", "")
+                body = resp.read(8192) if "html" in ct.lower() else b""
+                size = int(cl) if cl.isdigit() else (len(body) if body else None)
+                title = None
+                if body:
+                    mm = title_re.search(body)
+                    if mm:
+                        title = mm.group(1).decode("utf-8", errors="replace").strip()[:120]
+                return {"url": url, "status": resp.status, "size": size,
+                        "content_type": ct, "title": title}
+        except urllib.error.HTTPError as e:
+            return {"url": url, "status": e.code, "size": None, "content_type": "", "title": None}
+        except Exception:
+            return {"url": url, "status": None, "size": None, "content_type": "", "title": None}
+
+    # Reuse Stage 5's catch-all signature if present, else learn one.
+    signatures = set()
+    meta = output_dir / "live-endpoints-meta.json"
+    if meta.exists():
+        try:
+            sig = (json.loads(meta.read_text()) or {}).get("catch_all_signature")
+            if sig:
+                signatures = {(sig["status"], sig["size"], sig["content_type"])}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if not signatures:
+        signatures = soft404_signatures(check, target_base)
+
+    hits = []
+    with ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS) as pool:
+        futures = [pool.submit(check, target_base + c) for c in sorted(candidates)]
+        for fut in as_completed(futures):
+            r = fut.result()
+            s = r.get("status")
+            # Keep genuine responses only: not a catch-all, not a 404, got a status.
+            if s is None or s == 404 or is_soft404(r, signatures):
+                continue
+            hits.append(r)
+
+    out_file = None
+    if hits:
+        out_file = output_dir / "mutated-routes.json"
+        with out_file.open("w", encoding="utf-8") as f:
+            for h in sorted(hits, key=lambda x: (x.get("status") or 999, x["url"])):
+                f.write(json.dumps(h) + "\n")
+        auth = sum(1 for h in hits if h.get("status") in (401, 403))
+        ok = sum(1 for h in hits if 200 <= (h.get("status") or 0) < 300)
+        Log.info(f"    {C.GREEN}[+]{C.RESET} {len(hits)} unreferenced route(s) responded "
+                 f"({ok} 2xx, {auth} auth-protected)")
+        Log.info(f"    {C.DIM}↳ Guessed from naming conventions — verify before reporting; see mutated-routes.json{C.RESET}")
+    else:
+        Log.info("    [-] No unreferenced routes found (all guesses were 404 / catch-all)")
+    return {"mutated_routes_file": out_file, "mutated_routes_count": len(hits)}
 
 
 # ---------- Stage 5b: Static metadata analysis ----------
@@ -7035,6 +7179,28 @@ def generate_report(target, output_dir, results):
             parts.append(end_sub())
     parts.append(end_section())
 
+    # ── Mutated / unreferenced routes (opt-in --mutate-routes) ────────
+    mut_rows = parse_jsonl(results.get("mutated_routes_file"))
+    if mut_rows:
+        mut_auth = sum(1 for r in mut_rows if r.get("status") in (401, 403))
+        parts.append(section("mutated", "Unreferenced Routes (guessed)",
+                             f"{len(mut_rows)} hit" + (f" · {mut_auth} auth" if mut_auth else ""),
+                             "error" if mut_auth else "warning", open_=True))
+        parts.append("<p class='empty'>Routes <strong>not seen in the JS</strong>, guessed from the "
+                     "naming of discovered endpoints and confirmed live (not 404, not the catch-all "
+                     "page). Verify before reporting — a guessed path existing isn't a finding by itself.</p>")
+        parts.append("<table><thead><tr><th>Status</th><th>URL</th><th>Type</th><th>Size</th>"
+                     "<th>Title</th></tr></thead><tbody>")
+        for r in mut_rows[:100]:
+            s = r.get("status"); size = r.get("size")
+            parts.append(f"<tr><td><code>{html_escape(str(s))}</code></td>"
+                         f"<td><code>{html_escape(r.get('url',''))}</code></td>"
+                         f"<td><code>{html_escape(r.get('content_type') or '')}</code></td>"
+                         f"<td>{f'{size:,}' if isinstance(size,int) else ''}</td>"
+                         f"<td>{html_escape(r.get('title') or '')}</td></tr>")
+        parts.append("</tbody></table>")
+        parts.append(end_section())
+
     # ── Runtime config ───────────────────────────────────────────────
     rc_findings = parse_jsonl(results.get("runtime_config_file"))
     rc_secrets  = parse_jsonl(results.get("runtime_config_secrets_file"))
@@ -9059,6 +9225,9 @@ def main():
     advanced.add_argument("--active-recon", action=argparse.BooleanOptionalAction,
                           default=None,
                           help="Enable / disable Stage 4b (Google dorks + broad Wayback)")
+    advanced.add_argument("--mutate-routes", action="store_true", default=False,
+                          help="Stage 5f: probe sibling/unreferenced routes guessed from "
+                               "discovered endpoints (extra requests — opt-in, URL mode)")
     # default=None so apply_profile() can detect "user didn't pass it" and
     # apply the profile's value; main() treats None as falsy (no Wayback skip).
     advanced.add_argument("--no-wayback", action="store_true", default=None,
@@ -9451,6 +9620,11 @@ def main():
     results["live_endpoints_file"] = live_file
     if live_file:
         results["live_count"] = count_nonempty_lines(live_file)
+
+    # Stage 5f — Route mutation (opt-in, URL mode: --mutate-routes)
+    if args.url and args.mutate_routes:
+        rm = discover_route_mutations(args.url, endpoints, output_dir, args.header)
+        results.update(rm)
 
     # Stage 5b — Static metadata analysis (maps, JSON, comments)
     meta = static_metadata_analysis(js_clean, output_dir, target_label, args.header,
