@@ -8166,7 +8166,10 @@ def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> No
     """Run inspector-js again as a subprocess so its stdout streams cleanly per-job.
     Pushes each output line into the job's Queue for SSE consumption."""
     import subprocess as _subprocess
-    cmd = [sys.executable, __file__]
+    # -u (unbuffered) so each print() in the child reaches our pipe immediately;
+    # without it stdout is block-buffered (~8 KB) and the live web log appears to
+    # hang — nothing shows until a buffer fills or the scan ends.
+    cmd = [sys.executable, "-u", __file__]
     if args_dict.get("url"):        cmd += ["-u", args_dict["url"]]
     if args_dict.get("dir"):        cmd += ["--dir", args_dict["dir"]]
     for h in args_dict.get("header", []) or []:
@@ -8190,6 +8193,7 @@ def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> No
             return
         env = os.environ.copy()
         env["NO_COLOR"] = "1"   # strip ANSI in subprocess output for cleaner web display
+        env["PYTHONUNBUFFERED"] = "1"   # belt-and-suspenders with -u: force live streaming
         proc = _subprocess.Popen(cmd, stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
                                   text=True, bufsize=1, env=env)
         _JOBS[job_id]["process"] = proc
