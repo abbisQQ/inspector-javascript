@@ -46,6 +46,7 @@ import re
 import shlex
 import shutil
 import ssl
+import signal
 import subprocess
 import sys
 import time
@@ -8162,6 +8163,35 @@ def _web_guess_content_type(suffix: str) -> str:
     }.get(suffix.lower(), "text/plain")
 
 
+def _kill_process_group(proc, grace: float) -> None:
+    """Terminate the scan child AND its descendants (katana, semgrep, trufflehog,
+    retire, …). A plain proc.terminate() signals only the direct child, leaving
+    the external tools it spawned running — so Stop appeared to do nothing.
+
+    The child is started in its own session (start_new_session=True), so its PID
+    is the process-group leader; signalling the group reaches every descendant.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    def _signal_group(sig):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)   # whole group
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.send_signal(sig)              # fall back to just the child
+            except Exception:
+                pass
+    _signal_group(signal.SIGTERM)                  # ask nicely first
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        _signal_group(signal.SIGKILL)              # then force
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> None:
     """Run inspector-js again as a subprocess so its stdout streams cleanly per-job.
     Pushes each output line into the job's Queue for SSE consumption."""
@@ -8194,14 +8224,15 @@ def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> No
         env = os.environ.copy()
         env["NO_COLOR"] = "1"   # strip ANSI in subprocess output for cleaner web display
         env["PYTHONUNBUFFERED"] = "1"   # belt-and-suspenders with -u: force live streaming
+        # start_new_session=True → child is its own process-group leader, so
+        # cancel can signal the whole group (katana/semgrep/… included).
         proc = _subprocess.Popen(cmd, stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
-                                  text=True, bufsize=1, env=env)
+                                  text=True, bufsize=1, env=env, start_new_session=True)
         _JOBS[job_id]["process"] = proc
         # Re-check in case the cancel arrived in the tiny window between the
         # initial check and the spawn — kill immediately.
         if _JOBS[job_id].get("cancel_requested"):
-            try: proc.terminate()
-            except Exception: pass
+            _kill_process_group(proc, WEB_CANCEL_GRACE_S)
         for line in iter(proc.stdout.readline, ""):
             # Strip residual ANSI if any
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n"))
@@ -8563,11 +8594,9 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                         job["log_q"].put("__CRASHED__")
                     self.send_response(204); self.end_headers(); return
                 try:
-                    proc.terminate()           # SIGTERM first — give it a moment to clean up
-                    try:
-                        proc.wait(timeout=WEB_CANCEL_GRACE_S)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()            # then SIGKILL
+                    # Kill the whole process group — SIGTERM, then SIGKILL — so the
+                    # external tools the scan spawned (katana/semgrep/…) die too.
+                    _kill_process_group(proc, WEB_CANCEL_GRACE_S)
                     job["status"] = "cancelled"
                     job["log_q"].put("\n[!] scan cancelled by user")
                     job["log_q"].put("__CRASHED__")    # reuse the CRASHED stream marker
