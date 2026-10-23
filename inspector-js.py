@@ -2720,15 +2720,53 @@ def run_jsluice(target_dir, output_dir, extra_dirs=()):
 
 # ---------- Stage 5: Live endpoint validation ----------
 
+# Static assets aren't worth probing as "endpoints" — they're just files.
+_PROBE_SKIP_EXTS = (
+    ".js", ".mjs", ".cjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif",
+    ".svg", ".ico", ".webp", ".bmp", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".webm", ".mp3", ".wav", ".pdf", ".zip", ".gz", ".tar", ".wasm",
+    ".txt", ".xml", ".json",   # json/xml static data; API JSON is found elsewhere
+)
+
+
+def _katana_routes(katana_file: Path, target_host: str) -> list:
+    """In-scope, non-asset routes the crawler already found. For server-rendered
+    apps these ARE the surface (forms/links/query-param routes like
+    /research?url=…, /allocations/4) — jsluice can't see them because they live
+    in HTML, not JS, so without this they'd be crawled and then ignored."""
+    if not katana_file or not Path(katana_file).exists():
+        return []
+    routes = []
+    seen = set()
+    try:
+        lines = katana_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for raw in lines:
+        u = raw.strip().split("#")[0]
+        if not u or u in seen or not u.startswith(("http://", "https://")):
+            continue
+        if not host_in_scope(u, target_host):
+            continue
+        # Skip static assets — compare against the path only, ignoring any query.
+        path = urlparse(u).path.lower()
+        if path.endswith(_PROBE_SKIP_EXTS):
+            continue
+        seen.add(u)
+        routes.append(u)
+    return routes
+
+
 def validate_endpoints(target, endpoints_file, output_dir, headers):
-    """Hit each in-scope endpoint to determine which are live."""
+    """Hit each in-scope endpoint to determine which are live.
+
+    URLs come from two sources: jsluice-extracted endpoints (endpoints_file) and
+    the crawler's own in-scope routes (katana-out.txt) — the latter matters for
+    server-rendered apps where the real surface is in HTML, not JS.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     stage_header(5, "Live endpoint validation")
-
-    if not endpoints_file or not Path(endpoints_file).exists():
-        Log.info("    [-] No endpoints file to validate")
-        return None
 
     target_parsed = urlparse(target)
     target_host = target_parsed.hostname or ""
@@ -2759,6 +2797,19 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
             full = target_base + "/" + url
         full = full.split("#")[0]  # drop fragment
         url_methods.setdefault(full, set()).add(method)
+
+    # Merge in the crawler's own in-scope routes (GET). These cover the
+    # server-rendered surface jsluice can't see (HTML forms/links, query-param
+    # routes). setdefault keeps anything jsluice already recorded.
+    katana_added = 0
+    for ku in _katana_routes(output_dir / "katana-out.txt", target_host):
+        if ku not in url_methods:
+            katana_added += 1
+        url_methods.setdefault(ku, set()).add("GET")
+    if katana_added:
+        Log.info(f"    {C.DIM}↳ +{katana_added} route(s) from the crawl (katana-out.txt) "
+                 f"not seen in JS — server-rendered surface{C.RESET}")
+
     urls = set(url_methods)
 
     # De-duplicated list of parameterized endpoints for the report / manual work.
