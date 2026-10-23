@@ -79,6 +79,7 @@ KATANA_LOW_URL_THRESHOLD = 20    # warn when fewer URLs than this are discovered
 FETCH_JS_TIMEOUT         = 20    # seconds per JS file download
 FETCH_GENERIC_TIMEOUT    = 15    # seconds for generic HTTP probes
 ENDPOINT_CHECK_TIMEOUT   = 10    # seconds per live-endpoint probe
+HTTP_USER_AGENT          = "Mozilla/5.0 inspector-js/1.0"  # UA for all outbound HTTP
 THREAD_POOL_WORKERS      = 10    # concurrent workers for JS download + endpoint probing
 
 # Minification detection heuristics
@@ -427,10 +428,8 @@ def _parse_raw_http_request(text: str) -> dict:
 
     # ── First line: classic request line `GET /path HTTP/1.1` ────────────────
     first = lines[0].strip()
-    pseudo_only = False
     if first.startswith(":"):
         # HTTP/2 pseudo-header style — no traditional request line
-        pseudo_only = True
         header_lines = lines
     else:
         parts = first.split(None, 2)
@@ -441,7 +440,6 @@ def _parse_raw_http_request(text: str) -> dict:
         else:
             # Doesn't look like a request line — assume the first line is a
             # header too (some exports start with the request line stripped)
-            pseudo_only = True
             header_lines = lines
 
     # ── Header lines ─────────────────────────────────────────────────────────
@@ -522,7 +520,7 @@ def parse_headers(headers):
         if ":" in h:
             k, v = h.split(":", 1)
             out[k.strip()] = v.strip()
-    out.setdefault("User-Agent", "Mozilla/5.0 inspector-js/1.0")
+    out.setdefault("User-Agent", HTTP_USER_AGENT)
     return out
 
 
@@ -1242,7 +1240,7 @@ def _spider_interact_with_page(page, page_url: str, target_host: str,
     forms_submitted = 0
     errors = 0
 
-    for pass_n in range(depth):
+    for _pass in range(depth):
         if _time.monotonic() > deadline_monotonic:
             break
         try:
@@ -1513,7 +1511,7 @@ def ajax_spider(target: str,
                 extra_http_headers={k: v for k, v in header_dict.items()
                                     if k.lower() != "user-agent"},
                 user_agent=header_dict.get("User-Agent",
-                                            "Mozilla/5.0 inspector-js/1.0"),
+                                            HTTP_USER_AGENT),
             )
 
             for page_url in page_urls:
@@ -1883,7 +1881,7 @@ def download_js(katana_out, output_dir, headers):
     with ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS) as pool:
         futures = {pool.submit(fetch, url): url for url in url_list}
         for fut in as_completed(futures):
-            url, fname, success, status, size = fut.result()
+            url, fname, success, status, _size = fut.result()
             if success:
                 ok += 1
                 if fname:
@@ -2127,7 +2125,7 @@ PUBLIC_NPM_PACKAGES = {
     "events", "util", "path-browserify", "path-to-regexp", "resolve-pathname",
     "value-equal", "shallowequal", "deepmerge", "qs", "query-string",
     "querystring-es3", "url", "punycode", "base64-js", "ieee754", "inherits",
-    "safe-buffer", "debug", "ms", "eventemitter3", "tslib", "js-cookie",
+    "safe-buffer", "debug", "ms", "eventemitter3", "js-cookie",
     "dompurify", "marked", "highlight.js", "prismjs", "d3", "chart.js", "three",
     "leaflet", "mapbox-gl", "bootstrap", "popper.js", "tinymce", "quill",
     "ckeditor", "codemirror", "monaco-editor", "socket.io-client", "i18next",
@@ -3411,7 +3409,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
     ctx = permissive_ssl_context()
 
     try:
-        req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
+        req = urllib.request.Request(cdx_url, headers={"User-Agent": HTTP_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT, context=ctx) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
         cdx_rows: list[list[str]] = json.loads(raw)
@@ -3450,13 +3448,11 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
         # Download the archived copy regardless — it may differ from the live version
         wb_url = _WB_FETCH.format(timestamp=timestamp, url=orig_url)
         try:
-            req2 = urllib.request.Request(wb_url, headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
+            req2 = urllib.request.Request(wb_url, headers={"User-Agent": HTTP_USER_AGENT})
             with urllib.request.urlopen(req2, timeout=_WB_DL_TIMEOUT, context=ctx) as resp2:
-                wb_status  = resp2.getcode()
-                wb_body    = resp2.read().decode("utf-8", errors="replace")
+                wb_body = resp2.read().decode("utf-8", errors="replace")
         except Exception:
-            wb_body   = ""
-            wb_status = None
+            wb_body = ""
 
         if not wb_body.strip().startswith(("{", "[")):
             # Not valid JSON — Wayback served an error page or HTML
@@ -3607,7 +3603,7 @@ def _google_cse_search(query: str, api_key: str, cse_id: str,
         )
         try:
             req = urllib.request.Request(api_url,
-                headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
+                headers={"User-Agent": HTTP_USER_AGENT})
             with urllib.request.urlopen(req, timeout=15,
                                         context=permissive_ssl_context()) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
@@ -3638,7 +3634,7 @@ def _query_cdx_for_ext(domain: str, ext: str, limit: int = 200) -> list[tuple[st
     url = _CDX_API + "?" + _up.urlencode(params)
     try:
         req = urllib.request.Request(url,
-            headers={"User-Agent": "Mozilla/5.0 inspector-js/1.0"})
+            headers={"User-Agent": HTTP_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_CDX_TIMEOUT,
                                     context=permissive_ssl_context()) as resp:
             rows = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -3753,7 +3749,7 @@ def active_recon_discovery(target: str, output_dir: Path, headers: list[str],
         Log.info(f"    [+] Wayback CDX returned {cdx_total} historical URL(s) "
                  f"across {len(cdx_per_ext)} extension(s)")
         # Add Wayback URLs to candidate set
-        for ext, rows in cdx_per_ext.items():
+        for _ext, rows in cdx_per_ext.items():
             for orig_url, _ts in rows:
                 candidate_urls.add(orig_url)
     else:
@@ -4039,7 +4035,6 @@ def _validate_leak_content(path: str, body: str) -> bool:
         return False
     bs = body.strip()
     head = bs[:500]
-    head_l = head.lower()
 
     # Anything that looks like an HTML page where we expected non-HTML is bogus
     if _looks_like_spa_catchall(bs) and not path.endswith((".html", ".htm")):
@@ -4427,8 +4422,6 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
         except Exception:
             continue
 
-        lines = content.splitlines()
-
         # ── HTTP calls ──
         for pattern, kind in _HTTP_CALL_PATTERNS:
             for m in pattern.finditer(content):
@@ -4716,9 +4709,10 @@ def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoi
     if new_endpoints and endpoints_file:
         existing = set()
         if Path(endpoints_file).exists():
-            for l in Path(endpoints_file).open(encoding="utf-8", errors="replace"):
-                try: existing.add(json.loads(l).get("url"))
-                except Exception: pass
+            with Path(endpoints_file).open(encoding="utf-8", errors="replace") as ef:
+                for l in ef:
+                    try: existing.add(json.loads(l).get("url"))
+                    except Exception: pass
         with Path(endpoints_file).open("a", encoding="utf-8") as f:
             for ep in new_endpoints:
                 if ep["url"] in existing:
@@ -6519,7 +6513,7 @@ def generate_report(target, output_dir, results):
     body_eps   = [e for e in in_scope if e.get("bodyParams")]
     query_eps  = [e for e in in_scope if e.get("queryParams") and not is_open_redirect_candidate(e)]
 
-    ep_badge_cls = "warning" if redir_eps else ("" if not in_scope else "")
+    ep_badge_cls = "warning" if redir_eps else ""
     parts.append(section("endpoints", "Endpoints",
                          f"{len(in_scope)} in scope · {len(out_scope)} external",
                          ep_badge_cls, open_=bool(endpoints)))
@@ -7012,7 +7006,7 @@ def generate_report(target, output_dir, results):
                         for v in lib["vulns"]), default=4)
         parts.append("<table><thead><tr><th>Library</th><th>Version</th><th>Severity</th>"
                      "<th>CVEs</th><th>Found in</th></tr></thead><tbody>")
-        for key, lib in sorted(vuln_libs.items(), key=lambda kv:(highest_sev(kv[1]),kv[0])):
+        for _key, lib in sorted(vuln_libs.items(), key=lambda kv:(highest_sev(kv[1]),kv[0])):
             sevs = sorted({(v.get("severity") or "low").lower() for v in lib["vulns"]},
                           key=lambda s: sev_rank.get(s,4))
             sev_badges = " ".join(
@@ -7527,7 +7521,7 @@ def _wiz_ask_headers() -> list:
     print(f"  {C.DIM}examples: Cookie: session=abc   /   Authorization: Bearer eyJ...{C.RESET}")
     while True:
         try:
-            raw = input(f"  > ").strip()
+            raw = input("  > ").strip()
         except EOFError:
             break
         if not raw:
@@ -8252,7 +8246,6 @@ def run_web_wizard(args) -> None:
     serving a form + live scan output via SSE."""
     import http.server as _hs
     import urllib.parse as _up
-    import shutil as _shutil
 
     bind = args.bind
     port = args.port
@@ -8512,8 +8505,8 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                         if USER_RULES_PATH.exists():
                             USER_RULES_PATH.unlink()
                         self._send_html(
-                            f"<p>✓ user-rules file deleted — defaults restored.</p>"
-                            f"<p><a href='/rules'>← back to rules</a></p>")
+                            "<p>✓ user-rules file deleted — defaults restored.</p>"
+                            "<p><a href='/rules'>← back to rules</a></p>")
                     except OSError as exc:
                         self._send_html(f"<h1>reset failed</h1><p>{html_escape(str(exc))}</p>", 500)
                     return
