@@ -3001,6 +3001,30 @@ COMMENT_PATTERNS = [
     (re.compile(r"//[^\n]{0,150}\bhttps?://[^\s<>'\"]+\.(corp|internal|local|intra)\b[^\s<>'\"]*", re.IGNORECASE), "internal_url"),
 ]
 
+# Internal infrastructure / topology references that leak during builds. Unlike
+# COMMENT_PATTERNS these match anywhere (code strings, not just // comments) —
+# minification strips comments but keeps these string literals, and recovered
+# source maps expose even more. High-signal, low-false-positive by design.
+INFRA_PATTERNS = [
+    # RFC1918 private IPv4 (+ optional port): 10/8, 172.16-31/12, 192.168/16
+    (re.compile(r"\b(?:10(?:\.\d{1,3}){3}"
+                r"|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+                r"|192\.168(?:\.\d{1,3}){2})(?::\d{2,5})?\b"), "internal_ip"),
+    # Cloud metadata endpoints (SSRF targets)
+    (re.compile(r"\b169\.254\.169\.254\b|\bmetadata\.google\.internal\b", re.IGNORECASE), "cloud_metadata"),
+    # Kubernetes / Consul service-mesh names
+    (re.compile(r"\b[a-z0-9-]+\.[a-z0-9-]+\.svc\.cluster\.local\b"
+                r"|\b[a-z0-9-]+\.(?:service|node)\.consul\b", re.IGNORECASE), "service_mesh"),
+    # Internal hostnames by reserved/private TLD
+    (re.compile(r"\bhttps?://[a-z0-9.-]+\.(?:corp|internal|intranet|intra|lan|local)\b[^\s\"'`<>]*", re.IGNORECASE), "internal_host"),
+    # Hardcoded API/base-URL assignments — reveal the real backend
+    (re.compile(r"(?i)\b(?:api[_-]?base(?:[_-]?url)?|base[_-]?url|api[_-]?url|api[_-]?host|backend[_-]?url|gateway[_-]?url)"
+                r"\s*[:=]\s*[\"'`](https?://[^\"'`\s]{4,200})[\"'`]"), "api_base_url"),
+]
+
+# Cap per finding-kind so one noisy bundle can't flood the report.
+METADATA_FINDING_CAP = 60
+
 # JSON files worth surfacing as exposures.
 SENSITIVE_JSON_NAMES = {
     "appsettings.json", "web.config.json", "secrets.json", "credentials.json",
@@ -3356,20 +3380,32 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
     if not json_findings and not swagger_endpoints:
         Log.info("    [-] No JSON exposures or API docs found")
 
-    # === Part 3: Developer comments ===
-    Log.verbose("grepping corpus for interesting comments")
+    # === Part 3: Developer comments + internal-infra references ===
+    # Scan BOTH the downloaded bundles (js_clean) AND any recovered source tree
+    # (sources/). Minification strips // comments, so when source maps recover
+    # real sources that's where the TODOs/FIXMEs/internal refs actually live —
+    # previously this scanned js_clean only and missed all of it.
+    Log.verbose("grepping corpus (bundles + recovered sources) for comments + internal refs")
     comment_findings = []
-    seen_lines = set()  # dedupe identical comments across files
+    seen_lines = set()       # dedupe identical findings across files
+    kind_counts = {}         # per-kind cap tracking
 
-    for jsfile in iter_js_files(js_clean):
+    scan_bases = [js_clean]
+    if sources_dir.exists() and any(sources_dir.iterdir()):
+        scan_bases.append(sources_dir)
+    scan_files = [(base, f) for base in scan_bases for f in iter_js_files(base)]
+    Log.verbose(f"scanning {len(scan_files)} file(s) across {len(scan_bases)} source root(s)")
+
+    for base, jsfile in scan_files:
         try:
             content = jsfile.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             continue
-        for pattern, kind in COMMENT_PATTERNS:
+        for pattern, kind in (*COMMENT_PATTERNS, *INFRA_PATTERNS):
             for m in pattern.finditer(content):
-                text = m.group(0).strip()
-                # Truncate excessively long matches
+                # For capture-group patterns (api_base_url) the URL is group 1.
+                text = (m.group(1) if (pattern.groups and kind == "api_base_url")
+                        else m.group(0)).strip()
                 if len(text) > 250:
                     text = text[:250] + "…"
                 # Skip license headers (very common false positive)
@@ -3381,13 +3417,15 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
                 key = (kind, text)
                 if key in seen_lines:
                     continue
+                if kind_counts.get(kind, 0) >= METADATA_FINDING_CAP:
+                    continue
                 seen_lines.add(key)
-                # Compute line number
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
                 line_num = content[:m.start()].count("\n") + 1
                 comment_findings.append({
                     "kind": kind,
                     "text": text,
-                    "file": jsfile.relative_to(js_clean).as_posix(),
+                    "file": jsfile.relative_to(base).as_posix(),
                     "line": line_num,
                 })
 
@@ -7105,15 +7143,18 @@ def generate_report(target, output_dir, results):
         by_kind = {}
         for c in comments:
             by_kind.setdefault(c.get("kind","?"), []).append(c)
-        order = ["credential_mention","leftover","lint_disabled","cve_reference","internal_url",
+        order = ["credential_mention","cloud_metadata","api_base_url","service_mesh","internal_host",
+                 "internal_ip","leftover","lint_disabled","cve_reference","internal_url",
                  "env_reference","fixme","hack","xxx","todo","ticket_reference","authorship"]
+        _err_kinds  = ("credential_mention","leftover","cve_reference","cloud_metadata")
+        _warn_kinds = ("lint_disabled","internal_url","api_base_url","service_mesh",
+                       "internal_host","internal_ip")
         for kind in order + [k for k in by_kind if k not in order]:
             items = by_kind.get(kind)
             if not items: continue
-            bcls = "error" if kind in ("credential_mention","leftover","cve_reference") else (
-                   "warning" if kind in ("lint_disabled","internal_url") else "neutral")
+            bcls = "error" if kind in _err_kinds else ("warning" if kind in _warn_kinds else "neutral")
             parts.append(sub(f"{kind.replace('_',' ')} ({len(items)})", len(items), bcls,
-                             open_=kind in ("credential_mention","leftover","cve_reference")))
+                             open_=kind in _err_kinds))
             parts.append("<table><thead><tr><th>File</th><th>Line</th><th>Comment</th></tr></thead><tbody>")
             for c in items[:30]:
                 parts.append("<tr>"

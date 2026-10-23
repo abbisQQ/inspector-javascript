@@ -248,5 +248,32 @@ class KatanaRoutesTests(unittest.TestCase):
         self.assertEqual(ijs._katana_routes(Path("/no/such/file.txt"), "t.com"), [])
 
 
+class InfraPatternTests(unittest.TestCase):
+    def _match(self, kind, text):
+        pat = {k: p for p, k in ijs.INFRA_PATTERNS}[kind]
+        m = pat.search(text)
+        return (m.group(1) if (m and kind == "api_base_url") else (m.group(0) if m else None))
+
+    def test_private_ips(self):
+        self.assertTrue(self._match("internal_ip", "connect 10.0.3.14:8080"))
+        self.assertTrue(self._match("internal_ip", "192.168.1.5"))
+        self.assertTrue(self._match("internal_ip", "172.16.0.99"))
+
+    def test_internal_ip_no_false_positive_on_public_or_netmask(self):
+        self.assertIsNone(self._match("internal_ip", "version 11.22.33.44"))
+        self.assertIsNone(self._match("internal_ip", "9.10.11.12 build"))
+        self.assertIsNone(self._match("internal_ip", "mask 255.255.255.0"))
+
+    def test_cloud_metadata_and_mesh(self):
+        self.assertTrue(self._match("cloud_metadata", "http://169.254.169.254/latest"))
+        self.assertTrue(self._match("service_mesh", "payments.prod.svc.cluster.local"))
+        self.assertTrue(self._match("service_mesh", "redis.service.consul"))
+
+    def test_internal_host_and_api_base(self):
+        self.assertTrue(self._match("internal_host", "https://api.corp.internal/v1"))
+        self.assertEqual(self._match("api_base_url", "const API_BASE_URL = 'https://api.x/v2'"),
+                         "https://api.x/v2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
