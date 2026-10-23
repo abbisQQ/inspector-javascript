@@ -20,10 +20,24 @@ Pipeline stages:
   5b   Static metadata analysis      — source maps, JSON files, developer comments
   5c   HTTP call + secret extraction — fetch/axios/XHR/Express routes, JWT/AWS/key patterns
   5d   Wayback maps                  — historically captured .js.map files (CDX API)
+  5e   Runtime config discovery      — fetch the JSON config the app loads at runtime
   6    Semgrep SAST                  — DOM sinks, eval, open redirect, cookie misconfig
   7    Retire.js                     — known-vulnerable library fingerprinting
   8    TruffleHog                    — secret/credential detection
   9    HTML report                   — dark-themed, collapsible, self-contained
+
+Source layout (this file is intentionally single-file — scp one script and run;
+jump between sections by searching for the "# ---------- <name> ----------" banners):
+  Pipeline constants · Banner + colors · Logging · Tool checks
+  Scope + redirect helpers · Shared HTTP / I/O helpers · Subprocess helper
+  Stages 1-9 + 5e, each under its own "Stage N:" banner, in pipeline order
+  Local directory mode (--dir): source collection
+  HTML report  (generate_report + templates)
+  Terminal wizard (-i)  ·  Web wizard (--serve): HTTP handler, SSE, job registry
+  Main (argparse, profile resolution, pipeline driver)
+
+Tests:  python3 -m unittest discover -s tests        (no third-party deps)
+Lint:   ruff check .                                 (config in ruff.toml)
 
 Usage:
   ./inspector-js.py -u https://target.com
@@ -646,10 +660,7 @@ def is_open_redirect_candidate(endpoint):
         return True
     # Also check the URL itself for ?param= patterns (some JSluice rows
     # capture the param in the URL but leave queryParams empty)
-    for param in REDIRECT_PARAMS:
-        if f"?{param}=" in url or f"&{param}=" in url:
-            return True
-    return False
+    return any(f"?{param}=" in url or f"&{param}=" in url for param in REDIRECT_PARAMS)
 
 
 # ---------- Subprocess helper ----------
@@ -1037,7 +1048,7 @@ def _pick_pages_breadth_first(target: str, katana_out: Path | None,
 
     # Small sites: skip the breadth sampling and scan everything we have budget for.
     if scan_all_below and len(candidates) <= max_pages - 1:
-        return [target] + candidates
+        return [target, *candidates]
 
     # Pass 1: one URL per /seg1/seg2/ prefix — breadth-first.
     # Budget check goes BEFORE append so seed counts toward `max_pages`.
@@ -1573,7 +1584,7 @@ def ajax_spider(target: str,
     # each entry "new" (= net value-add of the spider).
     already_known = set()
     if katana_out and katana_out.exists():
-        already_known = {l.strip() for l in katana_out.open() if l.strip()}
+        already_known = {ln.strip() for ln in katana_out.open() if ln.strip()}
     new_urls = sorted(u for u in discovered if u not in already_known)
 
     # Append to katana-out → download_js picks them up transparently in Stage 2.
@@ -2437,7 +2448,7 @@ def _extract_map_sources(map_path: Path, sources_dir: Path) -> tuple[list[str], 
     """
     try:
         data = json.loads(map_path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
+    except (OSError, ValueError):
         return [], 0
 
     src_paths: list[str] = data.get("sources", [])
@@ -2512,10 +2523,7 @@ def recover_source_maps(js_clean, output_dir, available_tools, target, headers):
             else:
                 custom_headers.extend(["-h", h])
 
-        cmd = tool_cmd("mapperplus") + [
-            "-u", target,
-            "-t", str(sources_dir),
-        ] + cookies_arg + custom_headers
+        cmd = [*tool_cmd("mapperplus"), "-u", target, "-t", str(sources_dir), *cookies_arg, *custom_headers]
 
         result = run(cmd, check=False, timeout=SOURCEMAPPER_TIMEOUT, capture=True, quiet=True)
         if result and result.returncode == 0:
@@ -2596,7 +2604,7 @@ def _template_literal_endpoints(js_files, known: set) -> list:
             query = urlparse(url).query
             records.append({
                 "url": url,
-                "queryParams": [k for k in urllib.parse.parse_qs(query, keep_blank_values=True)],
+                "queryParams": list(urllib.parse.parse_qs(query, keep_blank_values=True)),
                 "bodyParams": [], "method": "", "type": "templateLiteral",
                 "filename": path,
             })
@@ -2624,7 +2632,7 @@ def run_jsluice(target_dir, output_dir, extra_dirs=()):
                 chunk = js_files[i:i + JSLUICE_BATCH_SIZE]
                 try:
                     result = subprocess.run(
-                        ["jsluice", subcommand] + chunk,
+                        ["jsluice", subcommand, *chunk],
                         capture_output=True, text=True, timeout=JSLUICE_TIMEOUT,
                     )
                 except subprocess.TimeoutExpired:
@@ -3126,7 +3134,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
     if url_map_path.exists() and target:
         try:
             url_map_data: dict[str, str] = json.loads(url_map_path.read_text())
-        except Exception:
+        except (OSError, ValueError):
             url_map_data = {}
         already_probed = {e["url"] for e in exposed_maps}
         for _fname, js_url in url_map_data.items():
@@ -3749,7 +3757,7 @@ def active_recon_discovery(target: str, output_dir: Path, headers: list[str],
         Log.info(f"    [+] Wayback CDX returned {cdx_total} historical URL(s) "
                  f"across {len(cdx_per_ext)} extension(s)")
         # Add Wayback URLs to candidate set
-        for _ext, rows in cdx_per_ext.items():
+        for rows in cdx_per_ext.values():
             for orig_url, _ts in rows:
                 candidate_urls.add(orig_url)
     else:
@@ -4066,11 +4074,11 @@ def _validate_leak_content(path: str, body: str) -> bool:
         return bool(re.search(r"\b(source|gem|ruby)\s+['\"]", bs))
     if path == "/requirements.txt":
         # Each non-comment line should be a package spec (name + optional version)
-        lines = [l.strip() for l in bs.splitlines()
-                 if l.strip() and not l.startswith("#")]
+        lines = [ln.strip() for ln in bs.splitlines()
+                 if ln.strip() and not ln.startswith("#")]
         if not lines:
             return False
-        valid = sum(1 for l in lines if re.match(r"^[A-Za-z0-9_.\-]+([<>=!~].*)?$", l))
+        valid = sum(1 for ln in lines if re.match(r"^[A-Za-z0-9_.\-]+([<>=!~].*)?$", ln))
         return valid >= max(1, len(lines) // 2)
     if path == "/yarn.lock":
         return bs.startswith("# THIS IS AN AUTOGENERATED FILE") or '"@' in bs[:1000]
@@ -4616,7 +4624,7 @@ def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoi
             sig = (json.loads(meta_path.read_text()) or {}).get("catch_all_signature")
             if sig:
                 signatures = {(sig["status"], sig["size"], sig["content_type"])}
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError):
             pass
     if not signatures:
         signatures = soft404_signatures(probe, target_base)
@@ -4710,8 +4718,8 @@ def discover_runtime_config(target, output_dir, headers, http_calls_file, endpoi
         existing = set()
         if Path(endpoints_file).exists():
             with Path(endpoints_file).open(encoding="utf-8", errors="replace") as ef:
-                for l in ef:
-                    try: existing.add(json.loads(l).get("url"))
+                for ln in ef:
+                    try: existing.add(json.loads(ln).get("url"))
                     except Exception: pass
         with Path(endpoints_file).open("a", encoding="utf-8") as f:
             for ep in new_endpoints:
@@ -6497,9 +6505,8 @@ def generate_report(target, output_dir, results):
         if u in dead_urls:
             return True
         # Try resolving relative paths against the target host
-        if target_base_for_match and u.startswith("/"):
-            if (target_base_for_match + u) in dead_urls:
-                return True
+        if target_base_for_match and u.startswith("/") and (target_base_for_match + u) in dead_urls:
+            return True
         return False
 
     in_scope   = [e for e in endpoints if is_in_scope(e.get("url"), target_host)] if endpoints else []
@@ -6731,7 +6738,7 @@ def generate_report(target, output_dir, results):
     live_meta = {}
     if live_meta_path.exists():
         try: live_meta = json.loads(live_meta_path.read_text())
-        except Exception: pass
+        except (OSError, ValueError): pass
     title = "Live Endpoints"
     if live_meta.get("truncated"):
         title += f" ({live_meta.get('validated', 0)} of {live_meta.get('total_in_scope', '?')} probed)"
@@ -7326,7 +7333,7 @@ def generate_report(target, output_dir, results):
         if dorks_file and Path(dorks_file).exists():
             try:
                 dorks_data = json.loads(Path(dorks_file).read_text())
-            except Exception:
+            except (OSError, ValueError):
                 dorks_data = []
             if dorks_data:
                 parts.append(sub("Google dork URLs", len(dorks_data), "neutral", open_=False))
@@ -7464,8 +7471,6 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
     Log.info(f"    {C.GREEN}[+]{C.RESET} Report written to {report_path}")
     return report_path
 
-
-# ---------- Main ----------
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal interactive wizard (--interactive / -i)
@@ -8645,7 +8650,7 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                 "header": headers,
                 "profile": (form.get("profile", ["default"])[0] or "default"),
                 "proxy":   (form.get("proxy", [""])[0] or "").strip() or None,
-                "proxy_insecure": True if (form.get("proxy", [""])[0] or "").startswith("http://127.0.0.1") else False,
+                "proxy_insecure": (form.get("proxy", [""])[0] or "").startswith("http://127.0.0.1"),
                 "ajax_fill_forms": (form.get("ajax_fill_forms", ["off"])[0] or "off"),
             }
             # Output dir
@@ -8687,6 +8692,8 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
         print(f"\n  {C.YELLOW}shutting down{C.RESET}")
         httpd.shutdown()
 
+
+# ---------- Main (argparse, profile resolution, pipeline driver) ----------
 
 class HelpfulArgumentParser(argparse.ArgumentParser):
     """Print full help on any argparse error (missing arg, bad value, etc.)."""
@@ -9208,12 +9215,12 @@ def main():
     if swagger_file and swagger_file.exists() and endpoints and endpoints.exists():
         merged = 0
         try:
-            with endpoints.open("a", encoding="utf-8") as dst:
-                with swagger_file.open(encoding="utf-8", errors="replace") as src:
-                    for line in src:
-                        if line.strip():
-                            dst.write(line)
-                            merged += 1
+            with endpoints.open("a", encoding="utf-8") as dst, \
+                 swagger_file.open(encoding="utf-8", errors="replace") as src:
+                for line in src:
+                    if line.strip():
+                        dst.write(line)
+                        merged += 1
             results["endpoint_count"] = count_nonempty_lines(endpoints)
             Log.verbose(f"merged {merged} Swagger endpoint(s) into {endpoints.name}")
         except OSError as e:

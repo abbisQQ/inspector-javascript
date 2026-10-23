@@ -1,0 +1,35 @@
+# Lint config for Inspector-Javascript.
+#   ruff check .
+#
+# The tool is intentionally a single, self-contained script (drops into any
+# pentest box with no assets), so a few "smells" are deliberate house style
+# rather than defects — those are ignored below, with the reason. The point of
+# this file is to keep the *correctness* families (F/B/SIM/RUF/C4/PERF) green so
+# real issues stand out.
+
+target-version = "py39"
+line-length = 120
+
+[lint]
+select = ["F", "E", "W", "B", "SIM", "C4", "PERF", "RUF"]
+
+ignore = [
+    # Intentional house style / self-contained-script trade-offs:
+    "E501",     # long lines — mostly the embedded Semgrep YAML and HTML templates
+    "E701",     # multiple statements on one line (colon) — compact `if x: return`
+    "E702",     # multiple statements on one line (semicolon)
+    "E402",     # late imports — threading/queue kept next to the web job registry
+    "SIM105",   # try/except/pass is clearer than contextlib.suppress in hot paths
+    "SIM103",   # explicit if/return reads better with its guard comments
+    "PERF401",  # explicit build loops are clearer than comprehensions here
+    "PERF203",  # try/except per loop iteration is intentional — one bad item
+                # (a malformed line/file/response) must not abort the whole scan
+    # User-facing typography is deliberate (not homoglyph phishing):
+    "RUF001",   # ambiguous char in string  (e.g. "×", "→" in report/CLI text)
+    "RUF002",   # ambiguous char in docstring (en/em dashes)
+    "RUF003",   # ambiguous char in comment
+]
+
+[lint.per-file-ignores]
+# Tests load the hyphenated module via importlib and assert freely.
+"tests/*" = ["E402", "S101"]
