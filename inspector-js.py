@@ -16,6 +16,7 @@ Pipeline stages:
   4    JSluice                       — AST-based endpoint + secret extraction
   4b   Active recon                  — Google dorks + broad Wayback CDX (opt-in)
   4c   Well-known files              — robots/sitemap/.well-known/leaks probe
+  4d   Framework route manifests     — Next.js/Nuxt build-manifest route extraction
   5    Live endpoint validation      — HTTP probe all discovered endpoints
   5b   Static metadata analysis      — source maps, JSON files, developer comments
   5c   HTTP call + secret extraction — fetch/axios/XHR/Express routes, JWT/AWS/key patterns
@@ -3102,6 +3103,155 @@ def _unwrap_js_json(text: str) -> str:
     if m:
         text = text[m.end():].rstrip().rstrip(";")
     return text
+
+
+# ---------- Framework route manifests (Next.js / Nuxt) ----------
+
+# Next.js internal/non-navigable route keys to drop.
+_NEXT_INTERNAL_ROUTES = {
+    "/_app", "/_error", "/_document", "/_app.js", "/404", "/500",
+    "/layout", "/loading", "/error", "/not-found", "/template", "/default",
+    "/global-error", "/_not-found",
+}
+# App Router manifest keys end in one of these; strip to get the real path.
+_APP_ROUTER_SUFFIXES = ("/page", "/route")
+_APP_ROUTER_DROP_SUFFIXES = ("/layout", "/loading", "/error", "/not-found",
+                             "/template", "/default", "/global-error")
+
+
+def _clean_route(r: str) -> str:
+    """Normalise a framework route for probing: drop group markers, keep dynamic
+    segments as-is (they're parameterised, handled like EXPR downstream)."""
+    r = r.split("?")[0].strip()
+    # Route groups (app router) like /(marketing)/about are not real URL segments
+    r = re.sub(r"/\([^)]*\)", "", r) or "/"
+    return r
+
+
+def extract_nextjs_routes(text: str) -> set:
+    """Pages + App Router paths from a Next.js build manifest (static, no exec).
+
+    Pages Router: __BUILD_MANIFEST maps "/route": [chunks] (+ a sortedPages[]).
+    App Router:   app-build-manifest.json maps "/a/page" / "/a/route": [chunks].
+    """
+    routes = set()
+    looks_next = (any(k in text for k in
+                      ("__BUILD_MANIFEST", "_buildManifest", "sortedPages",
+                       "app-build-manifest", "/_next/"))
+                  # App Router manifest JSON has distinctive "/…/page"/"/…/route" keys
+                  or re.search(r'"/[A-Za-z0-9_\-./\[\]()@]*/(page|route)"\s*:', text))
+    if not looks_next:
+        return routes
+
+    # App Router: keys ending in /page or /route (strip the suffix). The prefix
+    # may be empty ("/page" → "/"); non-route entries (/layout, /not-found, …)
+    # don't end in /page|/route so they're excluded naturally.
+    for m in re.finditer(r'"((?:/[A-Za-z0-9_\-.\[\]()@]+)*)/(page|route)"\s*:', text):
+        base = _clean_route(m.group(1)) or "/"
+        routes.add(base)
+
+    # Pages Router: "/route": [ ... ]  (key immediately followed by a chunk array).
+    # Skip App Router keys (…/page, …/route, …/layout) — handled above, stripped.
+    for m in re.finditer(r'"(/[A-Za-z0-9_\-./\[\]]*)"\s*:\s*\[', text):
+        r = _clean_route(m.group(1))
+        if (r not in _NEXT_INTERNAL_ROUTES
+                and not r.endswith(_APP_ROUTER_SUFFIXES + _APP_ROUTER_DROP_SUFFIXES)):
+            routes.add(r)
+
+    # sortedPages: ["/", "/about", "/blog/[slug]", ...]
+    sp = re.search(r'sortedPages"?\s*:\s*\[([^\]]*)\]', text)
+    if sp:
+        for m in re.finditer(r'"(/[A-Za-z0-9_\-./\[\]]*)"', sp.group(1)):
+            r = _clean_route(m.group(1))
+            if r not in _NEXT_INTERNAL_ROUTES:
+                routes.add(r)
+
+    return {r for r in routes if r and r not in _NEXT_INTERNAL_ROUTES}
+
+
+def extract_nuxt_routes(text: str) -> set:
+    """Best-effort Nuxt route paths. Nuxt encodes routes as { path: "/x", ... }
+    in its router/manifest; minified bundles vary, so this is intentionally
+    conservative (only clear `path:"/..."` pairs, and only when Nuxt markers
+    are present) to avoid matching unrelated `path:` keys."""
+    if not any(k in text for k in ("__NUXT__", "/_nuxt/", "nuxt")):
+        return set()
+    routes = set()
+    for m in re.finditer(r'\bpath\s*:\s*["\'](/[A-Za-z0-9_\-./:*]*)["\']', text):
+        r = _clean_route(m.group(1))
+        if r:
+            routes.add(r)
+    return routes
+
+
+def extract_framework_routes(text: str) -> tuple:
+    """(framework, routes) for a chunk of JS/JSON, or (None, set())."""
+    next_routes = extract_nextjs_routes(text)
+    if next_routes:
+        return "nextjs", next_routes
+    nuxt_routes = extract_nuxt_routes(text)
+    if nuxt_routes:
+        return "nuxt", nuxt_routes
+    return None, set()
+
+
+def discover_framework_routes(js_clean, output_dir, endpoints_file):
+    """Stage 4d — mine Next.js/Nuxt build manifests in the corpus for page + API
+    routes that DOM crawling misses, and merge them into the endpoint list.
+    Static-only: works in URL mode (downloaded JS) and --dir mode (local tree)."""
+    stage_header("4d", "Framework route manifests (Next.js / Nuxt)")
+
+    frameworks = set()
+    routes = set()
+    # JS corpus (Pages Router _buildManifest.js, Nuxt) + build-manifest JSON
+    # files (App Router app-build-manifest.json) which iter_js_files skips.
+    manifest_jsons = [p for p in js_clean.rglob("*.json")
+                      if "manifest" in p.name.lower() and p.is_file()]
+    for jsfile in [*iter_js_files(js_clean), *manifest_jsons]:
+        try:
+            content = jsfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fw, rs = extract_framework_routes(content)
+        if fw:
+            frameworks.add(fw)
+            routes |= rs
+
+    if not routes:
+        Log.info("    [-] No Next.js/Nuxt route manifest found")
+        return {"framework_routes_file": None, "framework_routes_count": 0, "frameworks": []}
+
+    records = [{"url": r, "method": "", "queryParams": [], "bodyParams": [],
+                "type": f"{'|'.join(sorted(frameworks))}-route", "filename": "build-manifest"}
+               for r in sorted(routes)]
+    out_file = output_dir / "framework-routes.json"
+    out_file.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+    # Merge into endpoints.json (deduped) so Stage 5 probes them.
+    added = 0
+    if endpoints_file:
+        existing = set()
+        if Path(endpoints_file).exists():
+            with Path(endpoints_file).open(encoding="utf-8", errors="replace") as ef:
+                for ln in ef:
+                    try: existing.add(json.loads(ln).get("url"))
+                    except Exception: pass
+        with Path(endpoints_file).open("a", encoding="utf-8") as f:
+            for rec in records:
+                if rec["url"] not in existing:
+                    existing.add(rec["url"])
+                    f.write(json.dumps(rec) + "\n")
+                    added += 1
+
+    api_routes = sum(1 for r in routes if "/api/" in r or r.startswith("/api"))
+    Log.info(f"    {C.GREEN}[+]{C.RESET} {', '.join(sorted(frameworks))}: "
+             f"{len(routes)} route(s) from build manifest"
+             + (f" ({api_routes} API)" if api_routes else "")
+             + (f", {added} new" if added else ""))
+    Log.info(f"    {C.DIM}↳ Server-side routes DOM crawling misses — see framework-routes.json{C.RESET}")
+    return {"framework_routes_file": out_file,
+            "framework_routes_count": len(routes),
+            "frameworks": sorted(frameworks)}
 
 
 def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_root=None):
@@ -9264,6 +9414,18 @@ def main():
         results["endpoint_count"] = count_nonempty_lines(endpoints)
     if secrets:
         results["jsluice_secrets"] = count_nonempty_lines(secrets)
+
+    # Stage 4d — Framework route manifests (Next.js / Nuxt). Static, both modes.
+    # endpoints may be None if jsluice produced nothing; fall back to endpoints.json.
+    fw_endpoints = endpoints or (output_dir / "endpoints.json")
+    fr = discover_framework_routes(js_clean, output_dir, fw_endpoints)
+    results.update(fr)
+    if fr.get("framework_routes_count"):
+        if not endpoints and fw_endpoints.exists():
+            endpoints = fw_endpoints
+            results["endpoints_file"] = endpoints
+        if endpoints and endpoints.exists():
+            results["endpoint_count"] = count_nonempty_lines(endpoints)
 
     # Stage 4c — Well-known files probe (URL mode only — needs a base URL)
     # Always-on passive recon: every probed path is public by convention.

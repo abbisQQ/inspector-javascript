@@ -275,5 +275,38 @@ class InfraPatternTests(unittest.TestCase):
                          "https://api.x/v2")
 
 
+class FrameworkRouteTests(unittest.TestCase):
+    def test_nextjs_pages_router(self):
+        text = ('self.__BUILD_MANIFEST={"/":["a"],"/login":["b"],'
+                '"/api/users/[id]":["c"],"/_error":["e"],'
+                'sortedPages:["/","/login","/api/users/[id]","/_app"]};'
+                'self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB()')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nextjs")
+        self.assertEqual(routes, {"/", "/login", "/api/users/[id]"})   # /_error, /_app dropped
+
+    def test_nextjs_app_router(self):
+        text = ('{"pages":{"/page":["c1"],"/about/page":["c2"],'
+                '"/api/users/route":["c3"],"/dashboard/(admin)/settings/page":["c4"],'
+                '"/layout":["l"],"/not-found":["n"]}}')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nextjs")
+        self.assertEqual(routes, {"/", "/about", "/api/users", "/dashboard/settings"})
+        self.assertNotIn("/page", routes)       # suffix stripped, not left raw
+        self.assertNotIn("/layout", routes)     # non-route entry dropped
+
+    def test_nuxt_routes(self):
+        text = ('window.__NUXT__={};'
+                'const r=[{path:"/",component:a},{path:"/products/:id",component:b},'
+                '{path:"/checkout",component:c}]')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nuxt")
+        self.assertEqual(routes, {"/", "/products/:id", "/checkout"})
+
+    def test_plain_js_no_false_positive(self):
+        self.assertEqual(ijs.extract_framework_routes('const x={"/foo":1};fetch("/api/y")'),
+                         (None, set()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
