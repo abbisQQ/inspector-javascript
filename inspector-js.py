@@ -8015,24 +8015,24 @@ const stopBtn = document.getElementById('stopBtn');
 const status = document.getElementById('status');
 const jobId = "{job_id}";
 
-stopBtn.addEventListener('click', async () => {{
+stopBtn.addEventListener('click', async () => {
     if (!confirm('Stop the running scan? Partial results will be lost.')) return;
     stopBtn.disabled = true;
     stopBtn.textContent = 'stopping…';
-    try {{
-        await fetch('/jobs/' + jobId + '/cancel', {{method: 'POST'}});
-    }} catch (e) {{
+    try {
+        await fetch('/jobs/' + jobId + '/cancel', {method: 'POST'});
+    } catch (e) {
         stopBtn.textContent = 'stop failed';
-    }}
-}});
+    }
+});
 
-function markFinished() {{
+function markFinished() {
     stopBtn.style.display = 'none';
-}}
+}
 
 const es = new EventSource('/events/' + jobId);
-es.onmessage = (ev) => {{
-    if (ev.data === '__DONE__') {{
+es.onmessage = (ev) => {
+    if (ev.data === '__DONE__') {
         es.close();
         status.textContent = 'done';
         status.className = 'done';
@@ -8042,8 +8042,8 @@ es.onmessage = (ev) => {{
         dirBtn.href = '/jobs/' + jobId + '/files/';
         markFinished();
         return;
-    }}
-    if (ev.data === '__CRASHED__') {{
+    }
+    if (ev.data === '__CRASHED__') {
         es.close();
         status.textContent = (stopBtn.textContent === 'stopping…') ? 'cancelled' : 'crashed';
         status.className = 'crashed';
@@ -8052,7 +8052,7 @@ es.onmessage = (ev) => {{
         dirBtn.href = '/jobs/' + jobId + '/files/';
         markFinished();
         return;
-    }}
+    }
     const line = ev.data;
     const div = document.createElement('div');
     if (line.includes('[*] Stage'))      div.className = 'log-stage';
@@ -8063,8 +8063,8 @@ es.onmessage = (ev) => {{
     div.textContent = line;
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
-}};
-es.onerror = () => {{ status.textContent = 'lost connection'; status.className = 'crashed'; }};
+};
+es.onerror = () => { status.textContent = 'lost connection'; status.className = 'crashed'; };
 </script>
 </body>
 </html>
