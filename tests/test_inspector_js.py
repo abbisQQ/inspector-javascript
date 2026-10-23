@@ -221,5 +221,32 @@ class CollectLocalSourcesTests(unittest.TestCase):
             self.assertFalse((out / "js-clean" / "node_modules" / "react" / "index.js").exists())
 
 
+class KatanaRoutesTests(unittest.TestCase):
+    def test_keeps_in_scope_routes_skips_assets_and_offsite(self):
+        with tempfile.TemporaryDirectory() as d:
+            kf = Path(d) / "katana-out.txt"
+            kf.write_text("\n".join([
+                "http://t.com/dashboard",
+                "http://t.com/research?url=https://evil.com",   # query route kept (path in scope)
+                "http://t.com/vendor/jquery.min.js",            # asset skipped
+                "http://t.com/style.css",                       # asset skipped
+                "http://t.com/dashboard",                       # dup collapsed
+                "https://other.com/x",                          # off-site skipped
+                "http://t.com/allocations/4#frag",              # fragment stripped
+                "",                                             # blank skipped
+            ]))
+            routes = ijs._katana_routes(kf, "t.com")
+        self.assertIn("http://t.com/dashboard", routes)
+        self.assertIn("http://t.com/research?url=https://evil.com", routes)
+        self.assertIn("http://t.com/allocations/4", routes)
+        self.assertNotIn("http://t.com/vendor/jquery.min.js", routes)
+        self.assertNotIn("http://t.com/style.css", routes)
+        self.assertFalse(any("other.com" in r for r in routes))
+        self.assertEqual(len(routes), len(set(routes)))       # deduped
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(ijs._katana_routes(Path("/no/such/file.txt"), "t.com"), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
