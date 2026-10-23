@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3.11
+#!/usr/bin/env python3
 """
 inspector-js.py — Automated JavaScript analysis pipeline for web app pentesting.
 
