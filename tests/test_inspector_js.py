@@ -386,5 +386,24 @@ class CrossOriginScriptTests(unittest.TestCase):
             self.assertTrue(ijs._is_third_party_script(u), u)
 
 
+class LineLookupTests(unittest.TestCase):
+    def test_matches_naive_count(self):
+        import random
+        for _ in range(100):
+            content = "".join(random.choice("ab\n\nx ") for _ in range(300))
+            line_of = ijs.make_line_lookup(content)
+            for pos in range(0, len(content) + 1, 5):
+                self.assertEqual(line_of(pos), content[:pos].count("\n") + 1)
+
+    def test_basics(self):
+        line_of = ijs.make_line_lookup("a\nbb\nccc")
+        self.assertEqual(line_of(0), 1)    # 'a'
+        self.assertEqual(line_of(2), 2)    # first 'b'
+        self.assertEqual(line_of(5), 3)    # first 'c'
+
+    def test_empty_content(self):
+        self.assertEqual(ijs.make_line_lookup("")(0), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

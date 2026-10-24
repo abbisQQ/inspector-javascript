@@ -52,6 +52,7 @@ Usage:
 
 import argparse
 import base64
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -619,6 +620,18 @@ def is_soft404(result: dict, signatures: set, size_tolerance: int = 96) -> bool:
     return False
 
 
+def make_line_lookup(content: str):
+    """Return a fast `pos -> 1-based line number` function for `content`.
+
+    Precomputes newline offsets once (O(n)); each lookup is then O(log lines)
+    via bisect. The old idiom `content[:pos].count("\\n")+1` re-slices and
+    re-counts from the start of the file on every match — O(matches × filesize),
+    which is costly on the large minified bundles this tool scans.
+    """
+    offsets = [i for i, ch in enumerate(content) if ch == "\n"]
+    return lambda pos: bisect.bisect_left(offsets, pos) + 1
+
+
 def count_nonempty_lines(path):
     """Count non-empty lines in a file. Returns 0 on any error."""
     if not path or not Path(path).exists():
@@ -953,9 +966,9 @@ def _spider_fake_value(input_type: str, name: str) -> str:
     name_l = (name or "").lower()
     rand_suffix = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
-    if input_type in ("email",) or "email" in name_l or "mail" in name_l:
+    if input_type == "email" or "email" in name_l or "mail" in name_l:
         return f"inspector-js-test+{rand_suffix}@example.com"
-    if input_type in ("url",) or "url" in name_l or "website" in name_l:
+    if input_type == "url" or "url" in name_l or "website" in name_l:
         return "https://example.com/inspector-js-test"
     if input_type == "tel" or "phone" in name_l or "mobile" in name_l:
         return "+15555550100"   # 555-01xx is non-dialable reserved range
@@ -3775,6 +3788,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        line_of = make_line_lookup(content)
         # Third-party bundle? Keep only real leaks from it, not its own chatter —
         # a library's // TODO / env mentions are noise, not the app's secrets.
         is_vendor = _looks_like_vendor_file(jsfile.name)
@@ -3797,7 +3811,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
                     continue
                 seen_lines.add(key)
                 kind_counts[kind] = kind_counts.get(kind, 0) + 1
-                line_num = content[:m.start()].count("\n") + 1
+                line_num = line_of(m.start())
                 comment_findings.append({
                     "kind": kind,
                     "text": text,
@@ -4894,6 +4908,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
+        line_of = make_line_lookup(content)
 
         # ── HTTP calls ──
         for pattern, kind in _HTTP_CALL_PATTERNS:
@@ -4921,7 +4936,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
                 # For Express routes, also skip middleware mounts that are just "/" or ""
                 if kind == "express-route" and url in ("/", ""):
                     continue
-                line_no = content[: m.start()].count("\n") + 1
+                line_no = line_of(m.start())
                 http_calls.append({
                     "kind":   kind,
                     "method": method,
@@ -4957,7 +4972,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
                 if sk in seen_secrets:
                     continue
                 seen_secrets.add(sk)
-                line_no = content[: m.start()].count("\n") + 1
+                line_no = line_of(m.start())
                 # Redact the middle of the value so the report is safe to share
                 display = val if len(val) <= 12 else val[:6] + "…" + val[-4:]
                 secrets.append({
