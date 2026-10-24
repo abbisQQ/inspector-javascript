@@ -1456,8 +1456,7 @@ def _spider_interact_with_page(page, page_url: str, target_host: str,
                         pass
                     progressed = True
                     break   # restart outer loop — page likely navigated
-                else:
-                    Log.verbose(f"    [v] form-fill skipped: {info}")
+                Log.verbose(f"    [v] form-fill skipped: {info}")
             if not progressed:
                 break
 
@@ -3361,8 +3360,7 @@ def _clean_route(r: str) -> str:
     segments as-is (they're parameterised, handled like EXPR downstream)."""
     r = r.split("?")[0].strip()
     # Route groups (app router) like /(marketing)/about are not real URL segments
-    r = re.sub(r"/\([^)]*\)", "", r) or "/"
-    return r
+    return re.sub(r"/\([^)]*\)", "", r) or "/"
 
 
 def extract_nextjs_routes(text: str) -> set:
@@ -8989,7 +8987,7 @@ def run_web_wizard(args) -> None:
             self.end_headers()
 
         def do_GET(self) -> None:
-            if self.path == "/" or self.path == "/index.html":
+            if self.path in {"/", "/index.html"}:
                 self._send_html(_WEB_FORM_HTML)
                 return
 
@@ -8998,7 +8996,7 @@ def run_web_wizard(args) -> None:
             # output location for web jobs). Clicking one lands you on the
             # same /files/ tree the live progress page links to, AND on the
             # report if present. Survives server restarts.
-            if self.path == "/scans" or self.path == "/scans/":
+            if self.path in {"/scans", "/scans/"}:
                 web_root = Path("/tmp/inspector-js-web")
                 scans = []
                 if web_root.is_dir():
@@ -9057,7 +9055,7 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                 return
 
             # ── /rules — view defaults + edit user-added Semgrep rules ───────
-            if self.path == "/rules" or self.path == "/rules/":
+            if self.path in {"/rules", "/rules/"}:
                 user_yaml = ""
                 if USER_RULES_PATH.exists():
                     try: user_yaml = USER_RULES_PATH.read_text(encoding="utf-8")
@@ -9084,7 +9082,7 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                 if not base.is_dir():
                     self._send_html("404", 404); return
 
-                if rest == "report" or rest == "report/":
+                if rest in {"report", "report/"}:
                     rpt = base / "report.html"
                     if not rpt.exists():
                         self._send_html("<h1>no report</h1>", 404); return
@@ -9852,7 +9850,7 @@ def main():
         sources = recover_source_maps(js_clean, output_dir, available, args.url, args.header)
         results["source_maps"] = bool(sources)
         # Prefer source maps for downstream analysis when available
-        analysis_target = sources if sources else js_clean
+        analysis_target = sources or js_clean
     # ── end URL-mode block ───────────────────────────────────────────────────
 
     # Stage 4 — JSluice
