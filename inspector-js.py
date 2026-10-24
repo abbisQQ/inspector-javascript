@@ -1844,23 +1844,27 @@ def download_js(katana_out, output_dir, headers):
     # We always run this when HTML pages outnumber JS URLs by 2× or more —
     # otherwise a single Cloudflare-injected /cdn-cgi/scripts/email-decode.min.js
     # would make us skip the real site's bundles.
+    # Non-HTML resources can't carry <script src> — exclude assets AND data
+    # feeds (sitemap.xml, rss, robots.txt, json). Katana on some stacks (Liferay,
+    # etc.) emits ONLY sitemaps, which would otherwise masquerade as "pages".
+    _page_skip_exts = (".js", ".mjs", ".js.map", ".css", ".png", ".jpg",
+                       ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2",
+                       ".ico", ".pdf", ".zip", ".xml", ".rss", ".txt", ".json")
     page_urls = [u.strip() for u in katana_out.open()
                  if u.strip().startswith(("http://", "https://"))
-                 and not u.strip().split("?")[0].lower().endswith(
-                     (".js", ".mjs", ".js.map", ".css", ".png", ".jpg",
-                      ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2",
-                      ".ico", ".pdf", ".zip"))]
-    # If Katana found absolutely nothing (UA blocks, JS-only landers, geo blocks,
-    # CDN challenges, …), at least try the target's own homepage. It came in via
-    # `katana_target_url`, persisted by run_katana for exactly this fallback.
-    if not page_urls:
-        fb = output_dir / "katana-target.txt"
-        if fb.exists():
-            seed = fb.read_text(encoding="utf-8", errors="replace").strip()
-            if seed.startswith(("http://", "https://")):
-                page_urls = [seed]
-                Log.info(f"    [i] Katana output empty — fetching target homepage "
-                         f"directly as fallback ({seed})")
+                 and not u.strip().split("?")[0].lower().endswith(_page_skip_exts)]
+    # ALWAYS scrape the seed homepage — its <script src> tags are where the app's
+    # JS usually lives. Katana frequently emits only sitemaps/feeds/subpages and
+    # not the homepage itself; relying on it only as an empty-list fallback meant
+    # a site whose crawl returned sitemaps got an empty JS corpus.
+    fb = output_dir / "katana-target.txt"
+    if fb.exists():
+        seed = fb.read_text(encoding="utf-8", errors="replace").strip()
+        if seed.startswith(("http://", "https://")):
+            page_urls = [seed] + [u for u in page_urls if u != seed]
+            if len(page_urls) == 1:
+                Log.info(f"    [i] Crawl yielded no HTML pages — scraping the homepage "
+                         f"directly for <script src> ({seed})")
     should_scrape = (
         not url_list                                              # Katana found 0 JS
         or len(page_urls) >= max(2 * len(url_list), 5)            # JS count looks too low
