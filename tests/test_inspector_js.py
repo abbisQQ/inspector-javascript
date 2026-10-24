@@ -248,5 +248,88 @@ class KatanaRoutesTests(unittest.TestCase):
         self.assertEqual(ijs._katana_routes(Path("/no/such/file.txt"), "t.com"), [])
 
 
+class InfraPatternTests(unittest.TestCase):
+    def _match(self, kind, text):
+        pat = {k: p for p, k in ijs.INFRA_PATTERNS}[kind]
+        m = pat.search(text)
+        return (m.group(1) if (m and kind == "api_base_url") else (m.group(0) if m else None))
+
+    def test_private_ips(self):
+        self.assertTrue(self._match("internal_ip", "connect 10.0.3.14:8080"))
+        self.assertTrue(self._match("internal_ip", "192.168.1.5"))
+        self.assertTrue(self._match("internal_ip", "172.16.0.99"))
+
+    def test_internal_ip_no_false_positive_on_public_or_netmask(self):
+        self.assertIsNone(self._match("internal_ip", "version 11.22.33.44"))
+        self.assertIsNone(self._match("internal_ip", "9.10.11.12 build"))
+        self.assertIsNone(self._match("internal_ip", "mask 255.255.255.0"))
+
+    def test_cloud_metadata_and_mesh(self):
+        self.assertTrue(self._match("cloud_metadata", "http://169.254.169.254/latest"))
+        self.assertTrue(self._match("service_mesh", "payments.prod.svc.cluster.local"))
+        self.assertTrue(self._match("service_mesh", "redis.service.consul"))
+
+    def test_internal_host_and_api_base(self):
+        self.assertTrue(self._match("internal_host", "https://api.corp.internal/v1"))
+        self.assertEqual(self._match("api_base_url", "const API_BASE_URL = 'https://api.x/v2'"),
+                         "https://api.x/v2")
+
+
+class FrameworkRouteTests(unittest.TestCase):
+    def test_nextjs_pages_router(self):
+        text = ('self.__BUILD_MANIFEST={"/":["a"],"/login":["b"],'
+                '"/api/users/[id]":["c"],"/_error":["e"],'
+                'sortedPages:["/","/login","/api/users/[id]","/_app"]};'
+                'self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB()')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nextjs")
+        self.assertEqual(routes, {"/", "/login", "/api/users/[id]"})   # /_error, /_app dropped
+
+    def test_nextjs_app_router(self):
+        text = ('{"pages":{"/page":["c1"],"/about/page":["c2"],'
+                '"/api/users/route":["c3"],"/dashboard/(admin)/settings/page":["c4"],'
+                '"/layout":["l"],"/not-found":["n"]}}')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nextjs")
+        self.assertEqual(routes, {"/", "/about", "/api/users", "/dashboard/settings"})
+        self.assertNotIn("/page", routes)       # suffix stripped, not left raw
+        self.assertNotIn("/layout", routes)     # non-route entry dropped
+
+    def test_nuxt_routes(self):
+        text = ('window.__NUXT__={};'
+                'const r=[{path:"/",component:a},{path:"/products/:id",component:b},'
+                '{path:"/checkout",component:c}]')
+        fw, routes = ijs.extract_framework_routes(text)
+        self.assertEqual(fw, "nuxt")
+        self.assertEqual(routes, {"/", "/products/:id", "/checkout"})
+
+    def test_plain_js_no_false_positive(self):
+        self.assertEqual(ijs.extract_framework_routes('const x={"/foo":1};fetch("/api/y")'),
+                         (None, set()))
+
+
+class RouteMutationTests(unittest.TestCase):
+    def test_generates_parents_siblings_and_wordlist(self):
+        muts = ijs.generate_route_mutations(["/api/v1/users/42", "/api/v1/orders"])
+        # parents
+        self.assertIn("/api/v1/users", muts)
+        self.assertIn("/api/v1", muts)
+        self.assertIn("/api", muts)
+        # wordlist under a prefix and under a collection
+        self.assertIn("/api/v1/health", muts)
+        self.assertIn("/api/v1/orders/count", muts)
+        # singular/plural
+        self.assertIn("/api/v1/user", muts)
+
+    def test_excludes_dynamic_segments_and_known(self):
+        muts = ijs.generate_route_mutations(["/api/users/[id]", "/x/:slug", "/y/EXPR", "/health"])
+        self.assertFalse(any(tok in m for m in muts for tok in ("[", ":", "EXPR")))
+        self.assertNotIn("/health", muts)   # a seed itself is never echoed back
+
+    def test_cap_is_respected(self):
+        seeds = [f"/api/resource{i}/item" for i in range(50)]
+        self.assertLessEqual(len(ijs.generate_route_mutations(seeds, cap=120)), 120)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

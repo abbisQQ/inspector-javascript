@@ -16,11 +16,13 @@ Pipeline stages:
   4    JSluice                       — AST-based endpoint + secret extraction
   4b   Active recon                  — Google dorks + broad Wayback CDX (opt-in)
   4c   Well-known files              — robots/sitemap/.well-known/leaks probe
+  4d   Framework route manifests     — Next.js/Nuxt build-manifest route extraction
   5    Live endpoint validation      — HTTP probe all discovered endpoints
   5b   Static metadata analysis      — source maps, JSON files, developer comments
   5c   HTTP call + secret extraction — fetch/axios/XHR/Express routes, JWT/AWS/key patterns
   5d   Wayback maps                  — historically captured .js.map files (CDX API)
   5e   Runtime config discovery      — fetch the JSON config the app loads at runtime
+  5f   Route mutation (opt-in)       — probe sibling/unreferenced routes from naming conventions
   6    Semgrep SAST                  — DOM sinks, eval, open redirect, cookie misconfig
   7    Retire.js                     — known-vulnerable library fingerprinting
   8    TruffleHog                    — secret/credential detection
@@ -2983,6 +2985,149 @@ def validate_endpoints(target, endpoints_file, output_dir, headers):
     return output_file
 
 
+# ---------- Stage 5f: Route mutation (opt-in sibling/unreferenced discovery) ----------
+
+# High-value API/ops words to try under observed path prefixes.
+_ROUTE_MUTATION_WORDLIST = [
+    "health", "status", "healthz", "readyz", "livez", "ping", "version", "info",
+    "metrics", "debug", "config", "env", "settings", "actuator",
+    "users", "user", "admin", "accounts", "account", "auth", "login", "logout",
+    "register", "me", "profile", "session", "token", "refresh", "roles",
+    "permissions", "search", "export", "import", "list", "count", "all", "ids",
+    "swagger", "api-docs", "openapi", "graphql", "docs", "spec",
+]
+ROUTE_MUTATION_CAP = 300   # max candidate routes generated
+
+
+def generate_route_mutations(known_paths, cap: int = ROUTE_MUTATION_CAP) -> set:
+    """Derive sibling / parent / unreferenced route candidates from the paths we
+    actually observed — the useful core of API content-discovery, driven by the
+    target's own naming conventions (no external wordlist tool). Dynamic
+    segments (/[id], /:id, EXPR) are skipped since they can't be probed as-is."""
+    known = {p.split("?")[0].rstrip("/") or "/" for p in known_paths}
+    prefixes, last_segs = set(), set()
+    muts = set()
+
+    for p in known:
+        if any(tok in p for tok in ("EXPR", "[", "]", ":")):
+            continue
+        segs = [s for s in p.split("/") if s]
+        if not segs:
+            continue
+        # Parent paths: /a/b/c -> /a/b, /a
+        for i in range(1, len(segs)):
+            muts.add("/" + "/".join(segs[:i]))
+        prefixes.add("/" + "/".join(segs[:-1]) if len(segs) > 1 else "")   # parent dir
+        prefixes.add("/" + "/".join(segs))                                 # full path (collection sub-actions)
+        last_segs.add(segs[-1])
+
+    for pre in prefixes:
+        # Curated wordlist under each observed prefix
+        for w in _ROUTE_MUTATION_WORDLIST:
+            muts.add(f"{pre}/{w}")
+        # Cross-pollinate observed last segments + singular/plural variants
+        for seg in last_segs:
+            muts.add(f"{pre}/{seg}")
+            muts.add(f"{pre}/{seg[:-1]}" if seg.endswith("s") else f"{pre}/{seg}s")
+
+    muts = {m for m in muts
+            if m and m not in known and not any(t in m for t in ("EXPR", "[", ":"))}
+    return set(sorted(muts)[:cap])
+
+
+def discover_route_mutations(target, endpoints_file, output_dir, headers):
+    """Stage 5f (opt-in) — probe sibling/unreferenced routes derived from the
+    endpoints we found. Scope-gated, soft-404-aware, capped. Reports only hits
+    that are distinct from the catch-all page."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    stage_header("5f", "Route mutation (sibling / unreferenced discovery)")
+
+    target_parsed = urlparse(target)
+    target_host = target_parsed.hostname or ""
+    target_base = f"{target_parsed.scheme}://{target_parsed.netloc}"
+
+    # Seed from real hits (live-endpoints) + extracted endpoints, in scope only.
+    seeds = set()
+    live_file = output_dir / "live-endpoints.json"
+    for src in (live_file, endpoints_file):
+        for rec in parse_jsonl(src):
+            u = (rec.get("url") or "").strip()
+            if not u:
+                continue
+            path = urlparse(u).path if u.startswith(("http://", "https://")) else u.split("?")[0]
+            if path.startswith("/") and is_in_scope(u, target_host):
+                seeds.add(path)
+    if not seeds:
+        Log.info("    [-] No in-scope seed routes to mutate from")
+        return {"mutated_routes_file": None, "mutated_routes_count": 0}
+
+    candidates = generate_route_mutations(seeds)
+    Log.info(f"    {C.GREEN}[+]{C.RESET} {len(candidates)} candidate(s) from {len(seeds)} seed route(s)")
+
+    header_dict = parse_headers(headers)
+    ctx = permissive_ssl_context()
+    title_re = re.compile(rb"<title[^>]*>([^<]+)</title>", re.IGNORECASE)
+
+    def check(url):
+        try:
+            req = urllib.request.Request(url, headers=header_dict, method="GET")
+            with urllib.request.urlopen(req, context=ctx, timeout=ENDPOINT_CHECK_TIMEOUT) as resp:
+                ct = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip()
+                cl = resp.headers.get("Content-Length", "")
+                body = resp.read(8192) if "html" in ct.lower() else b""
+                size = int(cl) if cl.isdigit() else (len(body) if body else None)
+                title = None
+                if body:
+                    mm = title_re.search(body)
+                    if mm:
+                        title = mm.group(1).decode("utf-8", errors="replace").strip()[:120]
+                return {"url": url, "status": resp.status, "size": size,
+                        "content_type": ct, "title": title}
+        except urllib.error.HTTPError as e:
+            return {"url": url, "status": e.code, "size": None, "content_type": "", "title": None}
+        except Exception:
+            return {"url": url, "status": None, "size": None, "content_type": "", "title": None}
+
+    # Reuse Stage 5's catch-all signature if present, else learn one.
+    signatures = set()
+    meta = output_dir / "live-endpoints-meta.json"
+    if meta.exists():
+        try:
+            sig = (json.loads(meta.read_text()) or {}).get("catch_all_signature")
+            if sig:
+                signatures = {(sig["status"], sig["size"], sig["content_type"])}
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if not signatures:
+        signatures = soft404_signatures(check, target_base)
+
+    hits = []
+    with ThreadPoolExecutor(max_workers=THREAD_POOL_WORKERS) as pool:
+        futures = [pool.submit(check, target_base + c) for c in sorted(candidates)]
+        for fut in as_completed(futures):
+            r = fut.result()
+            s = r.get("status")
+            # Keep genuine responses only: not a catch-all, not a 404, got a status.
+            if s is None or s == 404 or is_soft404(r, signatures):
+                continue
+            hits.append(r)
+
+    out_file = None
+    if hits:
+        out_file = output_dir / "mutated-routes.json"
+        with out_file.open("w", encoding="utf-8") as f:
+            for h in sorted(hits, key=lambda x: (x.get("status") or 999, x["url"])):
+                f.write(json.dumps(h) + "\n")
+        auth = sum(1 for h in hits if h.get("status") in (401, 403))
+        ok = sum(1 for h in hits if 200 <= (h.get("status") or 0) < 300)
+        Log.info(f"    {C.GREEN}[+]{C.RESET} {len(hits)} unreferenced route(s) responded "
+                 f"({ok} 2xx, {auth} auth-protected)")
+        Log.info(f"    {C.DIM}↳ Guessed from naming conventions — verify before reporting; see mutated-routes.json{C.RESET}")
+    else:
+        Log.info("    [-] No unreferenced routes found (all guesses were 404 / catch-all)")
+    return {"mutated_routes_file": out_file, "mutated_routes_count": len(hits)}
+
+
 # ---------- Stage 5b: Static metadata analysis ----------
 
 # Curated comment patterns — devs leak intent in comments more than they realize.
@@ -3000,6 +3145,30 @@ COMMENT_PATTERNS = [
     (re.compile(r"//[^\n]*@(author|maintainer|owner)[:\s]+[^\n]{3,100}", re.IGNORECASE), "authorship"),
     (re.compile(r"//[^\n]{0,150}\bhttps?://[^\s<>'\"]+\.(corp|internal|local|intra)\b[^\s<>'\"]*", re.IGNORECASE), "internal_url"),
 ]
+
+# Internal infrastructure / topology references that leak during builds. Unlike
+# COMMENT_PATTERNS these match anywhere (code strings, not just // comments) —
+# minification strips comments but keeps these string literals, and recovered
+# source maps expose even more. High-signal, low-false-positive by design.
+INFRA_PATTERNS = [
+    # RFC1918 private IPv4 (+ optional port): 10/8, 172.16-31/12, 192.168/16
+    (re.compile(r"\b(?:10(?:\.\d{1,3}){3}"
+                r"|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+                r"|192\.168(?:\.\d{1,3}){2})(?::\d{2,5})?\b"), "internal_ip"),
+    # Cloud metadata endpoints (SSRF targets)
+    (re.compile(r"\b169\.254\.169\.254\b|\bmetadata\.google\.internal\b", re.IGNORECASE), "cloud_metadata"),
+    # Kubernetes / Consul service-mesh names
+    (re.compile(r"\b[a-z0-9-]+\.[a-z0-9-]+\.svc\.cluster\.local\b"
+                r"|\b[a-z0-9-]+\.(?:service|node)\.consul\b", re.IGNORECASE), "service_mesh"),
+    # Internal hostnames by reserved/private TLD
+    (re.compile(r"\bhttps?://[a-z0-9.-]+\.(?:corp|internal|intranet|intra|lan|local)\b[^\s\"'`<>]*", re.IGNORECASE), "internal_host"),
+    # Hardcoded API/base-URL assignments — reveal the real backend
+    (re.compile(r"(?i)\b(?:api[_-]?base(?:[_-]?url)?|base[_-]?url|api[_-]?url|api[_-]?host|backend[_-]?url|gateway[_-]?url)"
+                r"\s*[:=]\s*[\"'`](https?://[^\"'`\s]{4,200})[\"'`]"), "api_base_url"),
+]
+
+# Cap per finding-kind so one noisy bundle can't flood the report.
+METADATA_FINDING_CAP = 60
 
 # JSON files worth surfacing as exposures.
 SENSITIVE_JSON_NAMES = {
@@ -3078,6 +3247,155 @@ def _unwrap_js_json(text: str) -> str:
     if m:
         text = text[m.end():].rstrip().rstrip(";")
     return text
+
+
+# ---------- Framework route manifests (Next.js / Nuxt) ----------
+
+# Next.js internal/non-navigable route keys to drop.
+_NEXT_INTERNAL_ROUTES = {
+    "/_app", "/_error", "/_document", "/_app.js", "/404", "/500",
+    "/layout", "/loading", "/error", "/not-found", "/template", "/default",
+    "/global-error", "/_not-found",
+}
+# App Router manifest keys end in one of these; strip to get the real path.
+_APP_ROUTER_SUFFIXES = ("/page", "/route")
+_APP_ROUTER_DROP_SUFFIXES = ("/layout", "/loading", "/error", "/not-found",
+                             "/template", "/default", "/global-error")
+
+
+def _clean_route(r: str) -> str:
+    """Normalise a framework route for probing: drop group markers, keep dynamic
+    segments as-is (they're parameterised, handled like EXPR downstream)."""
+    r = r.split("?")[0].strip()
+    # Route groups (app router) like /(marketing)/about are not real URL segments
+    r = re.sub(r"/\([^)]*\)", "", r) or "/"
+    return r
+
+
+def extract_nextjs_routes(text: str) -> set:
+    """Pages + App Router paths from a Next.js build manifest (static, no exec).
+
+    Pages Router: __BUILD_MANIFEST maps "/route": [chunks] (+ a sortedPages[]).
+    App Router:   app-build-manifest.json maps "/a/page" / "/a/route": [chunks].
+    """
+    routes = set()
+    looks_next = (any(k in text for k in
+                      ("__BUILD_MANIFEST", "_buildManifest", "sortedPages",
+                       "app-build-manifest", "/_next/"))
+                  # App Router manifest JSON has distinctive "/…/page"/"/…/route" keys
+                  or re.search(r'"/[A-Za-z0-9_\-./\[\]()@]*/(page|route)"\s*:', text))
+    if not looks_next:
+        return routes
+
+    # App Router: keys ending in /page or /route (strip the suffix). The prefix
+    # may be empty ("/page" → "/"); non-route entries (/layout, /not-found, …)
+    # don't end in /page|/route so they're excluded naturally.
+    for m in re.finditer(r'"((?:/[A-Za-z0-9_\-.\[\]()@]+)*)/(page|route)"\s*:', text):
+        base = _clean_route(m.group(1)) or "/"
+        routes.add(base)
+
+    # Pages Router: "/route": [ ... ]  (key immediately followed by a chunk array).
+    # Skip App Router keys (…/page, …/route, …/layout) — handled above, stripped.
+    for m in re.finditer(r'"(/[A-Za-z0-9_\-./\[\]]*)"\s*:\s*\[', text):
+        r = _clean_route(m.group(1))
+        if (r not in _NEXT_INTERNAL_ROUTES
+                and not r.endswith(_APP_ROUTER_SUFFIXES + _APP_ROUTER_DROP_SUFFIXES)):
+            routes.add(r)
+
+    # sortedPages: ["/", "/about", "/blog/[slug]", ...]
+    sp = re.search(r'sortedPages"?\s*:\s*\[([^\]]*)\]', text)
+    if sp:
+        for m in re.finditer(r'"(/[A-Za-z0-9_\-./\[\]]*)"', sp.group(1)):
+            r = _clean_route(m.group(1))
+            if r not in _NEXT_INTERNAL_ROUTES:
+                routes.add(r)
+
+    return {r for r in routes if r and r not in _NEXT_INTERNAL_ROUTES}
+
+
+def extract_nuxt_routes(text: str) -> set:
+    """Best-effort Nuxt route paths. Nuxt encodes routes as { path: "/x", ... }
+    in its router/manifest; minified bundles vary, so this is intentionally
+    conservative (only clear `path:"/..."` pairs, and only when Nuxt markers
+    are present) to avoid matching unrelated `path:` keys."""
+    if not any(k in text for k in ("__NUXT__", "/_nuxt/", "nuxt")):
+        return set()
+    routes = set()
+    for m in re.finditer(r'\bpath\s*:\s*["\'](/[A-Za-z0-9_\-./:*]*)["\']', text):
+        r = _clean_route(m.group(1))
+        if r:
+            routes.add(r)
+    return routes
+
+
+def extract_framework_routes(text: str) -> tuple:
+    """(framework, routes) for a chunk of JS/JSON, or (None, set())."""
+    next_routes = extract_nextjs_routes(text)
+    if next_routes:
+        return "nextjs", next_routes
+    nuxt_routes = extract_nuxt_routes(text)
+    if nuxt_routes:
+        return "nuxt", nuxt_routes
+    return None, set()
+
+
+def discover_framework_routes(js_clean, output_dir, endpoints_file):
+    """Stage 4d — mine Next.js/Nuxt build manifests in the corpus for page + API
+    routes that DOM crawling misses, and merge them into the endpoint list.
+    Static-only: works in URL mode (downloaded JS) and --dir mode (local tree)."""
+    stage_header("4d", "Framework route manifests (Next.js / Nuxt)")
+
+    frameworks = set()
+    routes = set()
+    # JS corpus (Pages Router _buildManifest.js, Nuxt) + build-manifest JSON
+    # files (App Router app-build-manifest.json) which iter_js_files skips.
+    manifest_jsons = [p for p in js_clean.rglob("*.json")
+                      if "manifest" in p.name.lower() and p.is_file()]
+    for jsfile in [*iter_js_files(js_clean), *manifest_jsons]:
+        try:
+            content = jsfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fw, rs = extract_framework_routes(content)
+        if fw:
+            frameworks.add(fw)
+            routes |= rs
+
+    if not routes:
+        Log.info("    [-] No Next.js/Nuxt route manifest found")
+        return {"framework_routes_file": None, "framework_routes_count": 0, "frameworks": []}
+
+    records = [{"url": r, "method": "", "queryParams": [], "bodyParams": [],
+                "type": f"{'|'.join(sorted(frameworks))}-route", "filename": "build-manifest"}
+               for r in sorted(routes)]
+    out_file = output_dir / "framework-routes.json"
+    out_file.write_text("\n".join(json.dumps(r) for r in records), encoding="utf-8")
+
+    # Merge into endpoints.json (deduped) so Stage 5 probes them.
+    added = 0
+    if endpoints_file:
+        existing = set()
+        if Path(endpoints_file).exists():
+            with Path(endpoints_file).open(encoding="utf-8", errors="replace") as ef:
+                for ln in ef:
+                    try: existing.add(json.loads(ln).get("url"))
+                    except Exception: pass
+        with Path(endpoints_file).open("a", encoding="utf-8") as f:
+            for rec in records:
+                if rec["url"] not in existing:
+                    existing.add(rec["url"])
+                    f.write(json.dumps(rec) + "\n")
+                    added += 1
+
+    api_routes = sum(1 for r in routes if "/api/" in r or r.startswith("/api"))
+    Log.info(f"    {C.GREEN}[+]{C.RESET} {', '.join(sorted(frameworks))}: "
+             f"{len(routes)} route(s) from build manifest"
+             + (f" ({api_routes} API)" if api_routes else "")
+             + (f", {added} new" if added else ""))
+    Log.info(f"    {C.DIM}↳ Server-side routes DOM crawling misses — see framework-routes.json{C.RESET}")
+    return {"framework_routes_file": out_file,
+            "framework_routes_count": len(routes),
+            "frameworks": sorted(frameworks)}
 
 
 def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_root=None):
@@ -3356,20 +3674,32 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
     if not json_findings and not swagger_endpoints:
         Log.info("    [-] No JSON exposures or API docs found")
 
-    # === Part 3: Developer comments ===
-    Log.verbose("grepping corpus for interesting comments")
+    # === Part 3: Developer comments + internal-infra references ===
+    # Scan BOTH the downloaded bundles (js_clean) AND any recovered source tree
+    # (sources/). Minification strips // comments, so when source maps recover
+    # real sources that's where the TODOs/FIXMEs/internal refs actually live —
+    # previously this scanned js_clean only and missed all of it.
+    Log.verbose("grepping corpus (bundles + recovered sources) for comments + internal refs")
     comment_findings = []
-    seen_lines = set()  # dedupe identical comments across files
+    seen_lines = set()       # dedupe identical findings across files
+    kind_counts = {}         # per-kind cap tracking
 
-    for jsfile in iter_js_files(js_clean):
+    scan_bases = [js_clean]
+    if sources_dir.exists() and any(sources_dir.iterdir()):
+        scan_bases.append(sources_dir)
+    scan_files = [(base, f) for base in scan_bases for f in iter_js_files(base)]
+    Log.verbose(f"scanning {len(scan_files)} file(s) across {len(scan_bases)} source root(s)")
+
+    for base, jsfile in scan_files:
         try:
             content = jsfile.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except OSError:
             continue
-        for pattern, kind in COMMENT_PATTERNS:
+        for pattern, kind in (*COMMENT_PATTERNS, *INFRA_PATTERNS):
             for m in pattern.finditer(content):
-                text = m.group(0).strip()
-                # Truncate excessively long matches
+                # For capture-group patterns (api_base_url) the URL is group 1.
+                text = (m.group(1) if (pattern.groups and kind == "api_base_url")
+                        else m.group(0)).strip()
                 if len(text) > 250:
                     text = text[:250] + "…"
                 # Skip license headers (very common false positive)
@@ -3381,13 +3711,15 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
                 key = (kind, text)
                 if key in seen_lines:
                     continue
+                if kind_counts.get(kind, 0) >= METADATA_FINDING_CAP:
+                    continue
                 seen_lines.add(key)
-                # Compute line number
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
                 line_num = content[:m.start()].count("\n") + 1
                 comment_findings.append({
                     "kind": kind,
                     "text": text,
-                    "file": jsfile.relative_to(js_clean).as_posix(),
+                    "file": jsfile.relative_to(base).as_posix(),
                     "line": line_num,
                 })
 
@@ -6847,6 +7179,28 @@ def generate_report(target, output_dir, results):
             parts.append(end_sub())
     parts.append(end_section())
 
+    # ── Mutated / unreferenced routes (opt-in --mutate-routes) ────────
+    mut_rows = parse_jsonl(results.get("mutated_routes_file"))
+    if mut_rows:
+        mut_auth = sum(1 for r in mut_rows if r.get("status") in (401, 403))
+        parts.append(section("mutated", "Unreferenced Routes (guessed)",
+                             f"{len(mut_rows)} hit" + (f" · {mut_auth} auth" if mut_auth else ""),
+                             "error" if mut_auth else "warning", open_=True))
+        parts.append("<p class='empty'>Routes <strong>not seen in the JS</strong>, guessed from the "
+                     "naming of discovered endpoints and confirmed live (not 404, not the catch-all "
+                     "page). Verify before reporting — a guessed path existing isn't a finding by itself.</p>")
+        parts.append("<table><thead><tr><th>Status</th><th>URL</th><th>Type</th><th>Size</th>"
+                     "<th>Title</th></tr></thead><tbody>")
+        for r in mut_rows[:100]:
+            s = r.get("status"); size = r.get("size")
+            parts.append(f"<tr><td><code>{html_escape(str(s))}</code></td>"
+                         f"<td><code>{html_escape(r.get('url',''))}</code></td>"
+                         f"<td><code>{html_escape(r.get('content_type') or '')}</code></td>"
+                         f"<td>{f'{size:,}' if isinstance(size,int) else ''}</td>"
+                         f"<td>{html_escape(r.get('title') or '')}</td></tr>")
+        parts.append("</tbody></table>")
+        parts.append(end_section())
+
     # ── Runtime config ───────────────────────────────────────────────
     rc_findings = parse_jsonl(results.get("runtime_config_file"))
     rc_secrets  = parse_jsonl(results.get("runtime_config_secrets_file"))
@@ -7105,15 +7459,18 @@ def generate_report(target, output_dir, results):
         by_kind = {}
         for c in comments:
             by_kind.setdefault(c.get("kind","?"), []).append(c)
-        order = ["credential_mention","leftover","lint_disabled","cve_reference","internal_url",
+        order = ["credential_mention","cloud_metadata","api_base_url","service_mesh","internal_host",
+                 "internal_ip","leftover","lint_disabled","cve_reference","internal_url",
                  "env_reference","fixme","hack","xxx","todo","ticket_reference","authorship"]
+        _err_kinds  = ("credential_mention","leftover","cve_reference","cloud_metadata")
+        _warn_kinds = ("lint_disabled","internal_url","api_base_url","service_mesh",
+                       "internal_host","internal_ip")
         for kind in order + [k for k in by_kind if k not in order]:
             items = by_kind.get(kind)
             if not items: continue
-            bcls = "error" if kind in ("credential_mention","leftover","cve_reference") else (
-                   "warning" if kind in ("lint_disabled","internal_url") else "neutral")
+            bcls = "error" if kind in _err_kinds else ("warning" if kind in _warn_kinds else "neutral")
             parts.append(sub(f"{kind.replace('_',' ')} ({len(items)})", len(items), bcls,
-                             open_=kind in ("credential_mention","leftover","cve_reference")))
+                             open_=kind in _err_kinds))
             parts.append("<table><thead><tr><th>File</th><th>Line</th><th>Comment</th></tr></thead><tbody>")
             for c in items[:30]:
                 parts.append("<tr>"
@@ -8868,6 +9225,9 @@ def main():
     advanced.add_argument("--active-recon", action=argparse.BooleanOptionalAction,
                           default=None,
                           help="Enable / disable Stage 4b (Google dorks + broad Wayback)")
+    advanced.add_argument("--mutate-routes", action="store_true", default=False,
+                          help="Stage 5f: probe sibling/unreferenced routes guessed from "
+                               "discovered endpoints (extra requests — opt-in, URL mode)")
     # default=None so apply_profile() can detect "user didn't pass it" and
     # apply the profile's value; main() treats None as falsy (no Wayback skip).
     advanced.add_argument("--no-wayback", action="store_true", default=None,
@@ -9224,6 +9584,18 @@ def main():
     if secrets:
         results["jsluice_secrets"] = count_nonempty_lines(secrets)
 
+    # Stage 4d — Framework route manifests (Next.js / Nuxt). Static, both modes.
+    # endpoints may be None if jsluice produced nothing; fall back to endpoints.json.
+    fw_endpoints = endpoints or (output_dir / "endpoints.json")
+    fr = discover_framework_routes(js_clean, output_dir, fw_endpoints)
+    results.update(fr)
+    if fr.get("framework_routes_count"):
+        if not endpoints and fw_endpoints.exists():
+            endpoints = fw_endpoints
+            results["endpoints_file"] = endpoints
+        if endpoints and endpoints.exists():
+            results["endpoint_count"] = count_nonempty_lines(endpoints)
+
     # Stage 4c — Well-known files probe (URL mode only — needs a base URL)
     # Always-on passive recon: every probed path is public by convention.
     if args.url:
@@ -9248,6 +9620,11 @@ def main():
     results["live_endpoints_file"] = live_file
     if live_file:
         results["live_count"] = count_nonempty_lines(live_file)
+
+    # Stage 5f — Route mutation (opt-in, URL mode: --mutate-routes)
+    if args.url and args.mutate_routes:
+        rm = discover_route_mutations(args.url, endpoints, output_dir, args.header)
+        results.update(rm)
 
     # Stage 5b — Static metadata analysis (maps, JSON, comments)
     meta = static_metadata_analysis(js_clean, output_dir, target_label, args.header,
