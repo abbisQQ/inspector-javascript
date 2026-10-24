@@ -8660,31 +8660,206 @@ _JOB_LOCK = _threading.Lock()
 
 # ── Shared file-serving helpers (DRY across /jobs/<id>/files and /scans/<dir>/files) ──
 
-def _web_render_dir_listing(p: Path, base: Path, url_prefix: str, back_link: tuple[str, str]) -> str:
-    """Render the simple file-browser page for a directory.
-    `url_prefix` is the URL stem to prepend to each link (e.g. '/jobs/<id>/files'
-    or '/scans/<dir>/files'). `back_link` is (href, label) for the bottom-of-page
-    "back" link. Returns full HTML.
+_WEB_TEXT_SUFFIXES = {
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte", ".json",
+    ".txt", ".html", ".htm", ".css", ".map", ".xml", ".md", ".yml", ".yaml",
+    ".svg", ".csv", ".ini", ".conf", ".properties", "",
+}
+
+
+def _web_is_text_file(p: Path) -> bool:
+    return p.suffix.lower() in _WEB_TEXT_SUFFIXES
+
+
+def _web_findings_index(base: Path) -> dict:
+    """basename -> {error,warning,comment,secret,httpcall, findings:[{sev,line,label}]}.
+
+    Read from the scan's artifact JSONs so the file browser can badge each file
+    by severity and the file view can list its findings with line links.
     """
-    rows = []
-    if p != base:
-        parent_rel = p.parent.resolve().relative_to(base)
-        rows.append(f'<li><a href="{url_prefix}/{parent_rel}">../</a></li>')
-    for item in sorted(p.iterdir()):
+    idx: dict = {}
+
+    def rec(name):
+        return idx.setdefault(name, {"error": 0, "warning": 0, "comment": 0,
+                                     "secret": 0, "httpcall": 0, "findings": []})
+
+    def jsonl(fname):
+        p = base / fname
+        if not p.exists():
+            return []
+        out = []
+        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if ln:
+                try:
+                    out.append(json.loads(ln))
+                except ValueError:
+                    pass
+        return out
+
+    try:
+        data = json.loads((base / "semgrep.json").read_text(encoding="utf-8", errors="replace"))
+        for r in data.get("results", []):
+            name = Path(r.get("path", "")).name
+            if not name:
+                continue
+            sev = r.get("extra", {}).get("severity", "")
+            e = rec(name)
+            if sev == "ERROR":
+                e["error"] += 1
+            elif sev == "WARNING":
+                e["warning"] += 1
+            e["findings"].append({
+                "sev": sev.lower() or "info", "line": r.get("start", {}).get("line"),
+                "label": f"semgrep {sev}: " + r.get("check_id", "?").split(".")[-1]
+                         + " — " + r.get("extra", {}).get("message", "")[:140].replace("\n", " ")})
+    except (OSError, ValueError):
+        pass
+
+    for r in jsonl("comments.json"):
+        name = Path(r.get("file", "")).name
+        if name:
+            e = rec(name); e["comment"] += 1
+            e["findings"].append({"sev": "comment", "line": r.get("line"),
+                                  "label": f"comment [{r.get('kind','')}]: " + str(r.get("text", ""))[:140]})
+    for r in jsonl("secrets-extended.json"):
+        name = Path(r.get("file", "")).name
+        if name:
+            e = rec(name); e["secret"] += 1
+            e["findings"].append({"sev": "secret", "line": r.get("line"),
+                                  "label": f"secret [{r.get('kind','')}]: " + str(r.get("match", ""))[:80]})
+    for r in jsonl("http-calls.json"):
+        name = Path(r.get("file", "")).name
+        if name:
+            e = rec(name); e["httpcall"] += 1
+            e["findings"].append({"sev": "http", "line": r.get("line"),
+                                  "label": f"http {r.get('method','')} " + str(r.get("url", ""))[:100]})
+    return idx
+
+
+def _web_badges(r: dict) -> str:
+    if not r:
+        return ""
+    bits = []
+    if r["error"]:    bits.append(f"<span class='bdg err'>{r['error']}✖</span>")
+    if r["secret"]:   bits.append(f"<span class='bdg err'>{r['secret']}🔑</span>")
+    if r["warning"]:  bits.append(f"<span class='bdg warn'>{r['warning']}▲</span>")
+    if r["comment"]:  bits.append(f"<span class='bdg note'>{r['comment']}✎</span>")
+    if r["httpcall"]: bits.append(f"<span class='bdg note'>{r['httpcall']}⇄</span>")
+    return " ".join(bits)
+
+
+_WEB_BROWSE_CSS = (
+    "body{font:13px/1.5 ui-monospace,Menlo,monospace;background:#0f1115;color:#e6e8ec;padding:24px;margin:0}"
+    "h2{color:#5eead4;margin:0 0 14px;font-size:15px}"
+    "ul{list-style:none;padding-left:16px;margin:0;border-left:1px solid #222a35}"
+    "li{margin:1px 0;white-space:nowrap}"
+    "a{color:#9fe8dc;text-decoration:none}a:hover{text-decoration:underline}"
+    "details>summary{cursor:pointer;color:#5eead4;list-style:none}"
+    ".file.has-find>a{color:#e6edf3}"
+    ".bdg{font-size:10px;padding:0 5px;border-radius:7px;margin-left:5px}"
+    ".bdg.err{background:#3a1416;color:#ff8d8d}.bdg.warn{background:#3a2e12;color:#f5c451}"
+    ".bdg.note{background:#1f242e;color:#8b93a3}"
+    ".back{margin-top:18px}.muted{color:#8b93a3}"
+    ".code{background:#11151c;border:1px solid #222a35;border-radius:6px;overflow:auto;margin-top:10px}"
+    ".ln{display:flex;padding:0 8px;white-space:pre}.ln .n{color:#4a5568;width:52px;flex:0 0 52px;text-align:right;padding-right:12px;user-select:none}"
+    ".ln.hit{background:#2a1416}.ln.hitw{background:#2a2410}"
+    ".panel li{white-space:normal;margin:4px 0}.panel .err{color:#ff8d8d}.panel .warning{color:#ff8d8d}"
+    ".panel .comment,.panel .http{color:#8b93a3}.panel .secret{color:#ff8d8d}"
+)
+
+
+def _web_render_tree(root: Path, base: Path, url_prefix: str, index: dict) -> str:
+    items = []
+    for item in sorted(root.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
         rel = item.resolve().relative_to(base)
-        suffix = "/" if item.is_dir() else ""
-        rows.append(
-            f'<li><a href="{url_prefix}/{rel}{suffix}">'
-            f'{html_escape(item.name)}{suffix}</a></li>'
-        )
+        if item.is_dir():
+            items.append(f"<li class='dir'><details open><summary>📁 {html_escape(item.name)}/</summary>"
+                         f"{_web_render_tree(item, base, url_prefix, index)}</details></li>")
+        else:
+            r = index.get(item.name)
+            cls = " has-find" if r and (r["error"] or r["warning"] or r["secret"]) else ""
+            items.append(f"<li class='file{cls}'><a href='{url_prefix}/{rel}'>"
+                         f"{html_escape(item.name)}</a>{(' ' + _web_badges(r)) if r else ''}</li>")
+    return f"<ul>{''.join(items)}</ul>"
+
+
+def _web_render_dir_listing(p: Path, base: Path, url_prefix: str,
+                            back_link: tuple, index=None) -> str:
+    """Findings-aware file tree for a directory (recursive; files badged by
+    severity and linked to the file view)."""
+    if index is None:
+        index = _web_findings_index(base)
+    # Build the tree from `p` downward; for the scan root show its children.
+    tree = _web_render_tree(p, base, url_prefix, index)
+    legend = ("<span class='muted'>legend: "
+              "<span class='bdg err'>✖ error</span> <span class='bdg err'>🔑 secret</span> "
+              "<span class='bdg warn'>▲ warning</span> <span class='bdg note'>✎ comment</span> "
+              "<span class='bdg note'>⇄ http call</span></span>")
     return (
-        f"<style>body{{font:13px monospace;background:#0f1115;color:#e6e8ec;padding:24px}}"
-        f"h2{{color:#5eead4;margin-top:0}} ul{{padding-left:18px}} li{{margin:2px 0}}"
-        f"a{{color:#5eead4;text-decoration:none}} a:hover{{text-decoration:underline}}</style>"
-        f"<h2>📁 {html_escape(str(p))}</h2>"
-        f"<ul>{''.join(rows)}</ul>"
-        f"<p style='margin-top:18px'><a href='{back_link[0]}'>{html_escape(back_link[1])}</a></p>"
+        f"<style>{_WEB_BROWSE_CSS}</style>"
+        f"<h2>📁 {html_escape(p.name or str(p))}/ &nbsp; {legend}</h2>"
+        f"{tree}"
+        f"<p class='back'><a href='{back_link[0]}'>{html_escape(back_link[1])}</a></p>"
     )
+
+
+def _web_render_file_view(p: Path, base: Path, url_prefix: str,
+                          back_link: tuple, index: dict) -> str:
+    """Render a text file with line numbers, its findings panel, and highlighted
+    finding lines. `url_prefix` is the /files stem (for the raw-download link)."""
+    rel = p.resolve().relative_to(base)
+    r = index.get(p.name) or {"findings": []}
+    finds = sorted(r["findings"], key=lambda f: (f.get("line") or 0))
+    hit_err = {f["line"] for f in finds if f["sev"] in ("error", "warning", "secret") and f.get("line")}
+    hit_warn = {f["line"] for f in finds if f["sev"] in ("comment", "http", "info") and f.get("line")}
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        content = ""
+    lines = content.split("\n")
+    MAX = 6000
+    rows = []
+    for i, ln in enumerate(lines[:MAX], 1):
+        cls = "ln hit" if i in hit_err else ("ln hitw" if i in hit_warn else "ln")
+        rows.append(f"<div id='L{i}' class='{cls}'><span class='n'>{i}</span>{html_escape(ln)}</div>")
+    more = (f"<div class='muted' style='padding:6px 8px'>… {len(lines)-MAX:,} more lines "
+            f"(<a href='{url_prefix}/{rel}?raw=1'>view raw</a>)</div>") if len(lines) > MAX else ""
+    panel = "".join(
+        f"<li class='{html_escape(f['sev'])}'><a href='#L{f.get('line')}'>L{f.get('line')}</a> "
+        f"{html_escape(f['label'])}</li>" for f in finds) or "<li class='muted'>No findings in this file.</li>"
+    return (
+        f"<style>{_WEB_BROWSE_CSS}</style>"
+        f"<h2>📄 {html_escape(rel.as_posix())} &nbsp; "
+        f"<span class='muted'>{_web_badges(index.get(p.name))}</span> &nbsp; "
+        f"<a class='muted' href='{url_prefix}/{rel}?raw=1'>raw</a></h2>"
+        f"<ul class='panel' style='list-style:none;padding-left:0;border:0'>{panel}</ul>"
+        f"<div class='code'>{''.join(rows)}{more}</div>"
+        f"<p class='back'><a href='{back_link[0]}'>{html_escape(back_link[1])}</a> · "
+        f"<a href='{url_prefix}/{rel.parent if rel.parent != Path('.') else ''}'>↑ folder</a></p>"
+    )
+
+
+def _web_serve_browse(handler, p: Path, base: Path, url_prefix: str,
+                      back_link: tuple, raw: bool = False) -> None:
+    """Shared /files handler for both /jobs and /scans: tree for dirs, findings
+    file-view for text files, raw bytes otherwise (or when ?raw=1)."""
+    index = _web_findings_index(base)
+    if p.is_dir():
+        handler._send_html(_web_render_dir_listing(p, base, url_prefix, back_link, index))
+        return
+    if p.is_file():
+        if (not raw) and _web_is_text_file(p):
+            handler._send_html(_web_render_file_view(p, base, url_prefix, back_link, index))
+            return
+        handler.send_response(200)
+        ctype = _web_guess_content_type(p.suffix)
+        handler.send_header("Content-Type", f"{ctype}; charset=utf-8")
+        handler.send_header("Content-Length", str(p.stat().st_size))
+        handler.end_headers()
+        handler.wfile.write(p.read_bytes())
+        return
+    handler._send_html("<h1>404</h1>", 404)
 
 
 def _web_guess_content_type(suffix: str) -> str:
@@ -8922,25 +9097,16 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                     return
 
                 if rest.startswith("files"):
-                    tail = rest[len("files"):].lstrip("/")
+                    rest_noq, _, query = rest.partition("?")
+                    tail = rest_noq[len("files"):].lstrip("/")
                     p = (base / tail).resolve()
                     try: p.relative_to(base)
                     except ValueError: self._send_html("403", 403); return
-                    if p.is_dir():
-                        self._send_html(_web_render_dir_listing(
-                            p, base,
-                            url_prefix=f"/scans/{dir_name}/files",
-                            back_link=("/scans", "← previous scans"),
-                        ))
-                        return
-                    if p.is_file():
-                        self.send_response(200)
-                        ctype = _web_guess_content_type(p.suffix)
-                        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
-                        self.send_header("Content-Length", str(p.stat().st_size))
-                        self.end_headers()
-                        self.wfile.write(p.read_bytes())
-                        return
+                    _web_serve_browse(self, p, base,
+                                      url_prefix=f"/scans/{dir_name}/files",
+                                      back_link=("/scans", "← previous scans"),
+                                      raw=("raw=1" in query))
+                    return
                     self._send_html("404", 404); return
                 self._send_html("404", 404); return
 
@@ -9001,26 +9167,16 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                 # Resolve `out` ONCE so all subsequent path math is symlink-safe.
                 # macOS /tmp → /private/tmp would otherwise break relative_to().
                 out = Path(job["output_dir"]).resolve()
-                tail = self.path.split("/files", 1)[1].lstrip("/")
+                after, _, query = self.path.split("/files", 1)[1].partition("?")
+                tail = after.lstrip("/")
                 p = (out / tail).resolve()
                 try: p.relative_to(out)
                 except ValueError: self._send_html("403", 403); return
-                if p.is_dir():
-                    self._send_html(_web_render_dir_listing(
-                        p, out,
-                        url_prefix=f"/jobs/{job_id}/files",
-                        back_link=(f"/jobs/{job_id}", "← back to job"),
-                    ))
-                    return
-                if p.is_file():
-                    self.send_response(200)
-                    ctype = _web_guess_content_type(p.suffix)
-                    self.send_header("Content-Type", f"{ctype}; charset=utf-8")
-                    self.send_header("Content-Length", str(p.stat().st_size))
-                    self.end_headers()
-                    self.wfile.write(p.read_bytes())
-                    return
-                self._send_html("404", 404); return
+                _web_serve_browse(self, p, out,
+                                  url_prefix=f"/jobs/{job_id}/files",
+                                  back_link=(f"/jobs/{job_id}", "← back to job"),
+                                  raw=("raw=1" in query))
+                return
             self._send_html("404", 404)
 
         def do_POST(self) -> None:
