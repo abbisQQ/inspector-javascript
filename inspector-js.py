@@ -3170,6 +3170,45 @@ INFRA_PATTERNS = [
 # Cap per finding-kind so one noisy bundle can't flood the report.
 METADATA_FINDING_CAP = 60
 
+# Comment text that is tooling/compiler boilerplate, never a developer lead.
+# Dropped from any file (extends the license-header filter).
+_COMMENT_NOISE_MARKERS = (
+    "@license", "licensed under", "all rights reserved", "creative commons",
+    "redistributions of source",
+    "eslint-disable", "eslint-enable", "tslint:", "@ts-", "ts-ignore",
+    "ts-expect-error", "prettier-ignore", "istanbul ignore", "c8 ignore",
+    "v8 ignore", "$flow", "flowfixme", "@flow", "react-internal",
+    "prod-error-codes", "__pure__", "#__pure__", "webpackignore",
+    "biome-ignore", "stylelint-disable", "sourcemappingurl",
+)
+
+# Filename markers for third-party bundles/vendors. Their TODOs/FIXMEs are the
+# library's notes, not the app's — only high-value leaks are kept from them.
+_VENDOR_FILE_MARKERS = (
+    "vendor", "vendors", "runtime", "polyfill", "polyfills", "framework",
+    "chunk-vendors", "react", "react-dom", "angular", "vue", "svelte",
+    "jquery", "lodash", "moment", "babel", "core-js", "webpack", "bootstrap",
+    "tinymce", "ckeditor", "three", "d3", "chart", "swiper", "redux",
+    "node_modules",
+)
+
+# Comment kinds that matter even inside vendor code (real leaks, not chatter).
+_HIGH_VALUE_COMMENT_KINDS = frozenset({
+    "credential_mention", "internal_ip", "cloud_metadata", "service_mesh",
+    "internal_host", "api_base_url", "cve_reference",
+})
+
+
+def _looks_like_vendor_file(name: str) -> bool:
+    """Heuristic: is this JS file a third-party bundle/library (not app code)?
+    Checks the filename (incl. the original name webpack/URL mode preserves) for
+    vendor markers or a known public npm package token."""
+    n = name.lower()
+    if any(mark in n for mark in _VENDOR_FILE_MARKERS):
+        return True
+    # tokens between separators, e.g. "47c0fe2c_react-vendor_4.36.6.js"
+    return any(tok and _is_public_npm_package(tok) for tok in re.split(r"[^a-z0-9.@/-]+", n))
+
 # JSON files worth surfacing as exposures.
 SENSITIVE_JSON_NAMES = {
     "appsettings.json", "web.config.json", "secrets.json", "credentials.json",
@@ -3695,18 +3734,20 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        # Third-party bundle? Keep only real leaks from it, not its own chatter —
+        # a library's // TODO / env mentions are noise, not the app's secrets.
+        is_vendor = _looks_like_vendor_file(jsfile.name)
         for pattern, kind in (*COMMENT_PATTERNS, *INFRA_PATTERNS):
+            if is_vendor and kind not in _HIGH_VALUE_COMMENT_KINDS:
+                continue
             for m in pattern.finditer(content):
                 # For capture-group patterns (api_base_url) the URL is group 1.
                 text = (m.group(1) if (pattern.groups and kind == "api_base_url")
                         else m.group(0)).strip()
                 if len(text) > 250:
                     text = text[:250] + "…"
-                # Skip license headers (very common false positive)
-                if any(noise in text.lower() for noise in [
-                    "@license", "licensed under", "all rights reserved",
-                    "creative commons", "redistributions of source",
-                ]):
+                # Skip license headers + tooling/compiler boilerplate.
+                if any(noise in text.lower() for noise in _COMMENT_NOISE_MARKERS):
                     continue
                 key = (kind, text)
                 if key in seen_lines:

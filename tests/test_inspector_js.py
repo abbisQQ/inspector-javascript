@@ -331,5 +331,30 @@ class RouteMutationTests(unittest.TestCase):
         self.assertLessEqual(len(ijs.generate_route_mutations(seeds, cap=120)), 120)
 
 
+class VendorFileAndNoiseTests(unittest.TestCase):
+    def test_vendor_files_detected(self):
+        for n in ["34115704_react.development.js", "5c2dd099_react-dom.development.js",
+                  "e6243397_angular_1-7-7.js", "vendors.abc.js", "runtime.123.js",
+                  "chunk-vendors.js", "jquery.min.js", "polyfills.js"]:
+            self.assertTrue(ijs._looks_like_vendor_file(n), n)
+
+    def test_app_files_not_misclassified(self):
+        for n in ["main.7c8cb9a3.js", "app.bundle.js", "index.js", "dashboard.js",
+                  "subscribeNow.js", "components__emails__EmailComposer.js"]:
+            self.assertFalse(ijs._looks_like_vendor_file(n), n)
+
+    def test_noise_markers_cover_tooling_comments(self):
+        for s in ["// eslint-disable-next-line react-internal/no-production-logging",
+                  "// $FlowFixMe only called in DEV", "/* prettier-ignore */",
+                  "// @ts-ignore", "/* istanbul ignore next */"]:
+            self.assertTrue(any(mark in s.lower() for mark in ijs._COMMENT_NOISE_MARKERS), s)
+
+    def test_high_value_kinds_kept_even_in_vendor(self):
+        # a leaked internal IP matters wherever it appears
+        self.assertIn("internal_ip", ijs._HIGH_VALUE_COMMENT_KINDS)
+        self.assertIn("api_base_url", ijs._HIGH_VALUE_COMMENT_KINDS)
+        self.assertNotIn("todo", ijs._HIGH_VALUE_COMMENT_KINDS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
