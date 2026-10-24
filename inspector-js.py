@@ -785,6 +785,32 @@ _HTML_JS_REFS = [
     re.compile(r'<link\b[^>]*\brel\s*=\s*["\']preload["\'][^>]*\bas\s*=\s*["\']script["\'][^>]*\bhref\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE),
 ]
 
+# Cross-origin <script src> hosts that are NOT the app's own code — analytics,
+# ads, tag/consent managers, chat widgets, captchas, RUM. The app's bundles,
+# even on a CDN (site.b-cdn.net, cloudfront, jsdelivr…), are kept; these aren't.
+_THIRD_PARTY_SCRIPT_MARKERS = (
+    "google-analytics", "googletagmanager", "googlesyndication", "doubleclick",
+    "/recaptcha/", "hcaptcha.com", "challenges.cloudflare.com", "adservice.",
+    "connect.facebook", "facebook.net", "platform.twitter", "platform.linkedin",
+    "segment.com", "segment.io", "mixpanel", "amplitude", "heap", "fullstory",
+    "hotjar", "mouseflow", "clarity.ms", "matomo", "plausible.io",
+    "criteo", "adnxs", "adsrvr", "taboola", "outbrain", "pubmatic",
+    "rubiconproject", "scorecardresearch", "quantserve", "bing.com",
+    "cookiebot", "onetrust", "cookielaw.org", "usercentrics", "iubenda",
+    "intercom", "drift.com", "zendesk", "zdassets", "tawk.to", "livechat",
+    "crisp.chat", "disqus", "addthis", "sharethis",
+    "newrelic", "nr-data.net", "bugsnag", "cloudflareinsights", "boomerang",
+    "youtube.com", "ytimg.com", "vimeo.com", "gstatic.com/firebasejs",
+    "cdn.jsdelivr.net/npm/@sentry", "browser.sentry-cdn.com",
+)
+
+
+def _is_third_party_script(url: str) -> bool:
+    """True if a cross-origin <script src> is a third-party service (tracker /
+    ad / widget / RUM), not the target's own code."""
+    u = url.lower()
+    return any(mark in u for mark in _THIRD_PARTY_SCRIPT_MARKERS)
+
 
 def _scripts_from_html_pages(page_urls: list[str], headers) -> list[str]:
     """Fetch each URL (text/html), parse <script src=> and <link modulepreload> refs.
@@ -828,9 +854,13 @@ def _scripts_from_html_pages(page_urls: list[str], headers) -> list[str]:
                     # Relative path — resolve against the page URL
                     from urllib.parse import urljoin
                     url = urljoin(page_url, ref)
-                # Same-host filter
+                # Scope: same-host JS is always kept. Cross-origin <script src>
+                # is kept too — the target's own page chose to load it, so a
+                # CDN-hosted app bundle (e.g. site.b-cdn.net/app.js) is first-party
+                # code and the whole point of the scan — EXCEPT known third-party
+                # trackers/ads/widgets, which are noise and not the target's code.
                 u_host = urlparse(url).hostname or ""
-                if not _host_matches(u_host, base_host):
+                if not _host_matches(u_host, base_host) and _is_third_party_script(url):
                     continue
                 # Strip the fragment, keep the query (some CMSes use bundlers with ?v=)
                 url = url.split("#", 1)[0]
