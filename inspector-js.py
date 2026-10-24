@@ -7446,9 +7446,23 @@ def generate_report(target, output_dir, results):
         except Exception:
             pass
 
-    sem_badge = "error" if results.get("semgrep_error",0) else ("warning" if sem_findings else "neutral")
+    # Split app-code findings from third-party/library code. Semgrep rules fire
+    # heavily on minified vendor bundles (React internals, webpack runtime,
+    # analytics tags), where they're almost always false positives — so those
+    # are demoted to a collapsed group and the badge reflects APP findings only.
+    def _sev(f):
+        return f.get("extra", {}).get("severity")
+    app_findings    = [f for f in sem_findings if not _looks_like_vendor_file(Path(f.get("path","")).name)]
+    vendor_findings = [f for f in sem_findings if _looks_like_vendor_file(Path(f.get("path","")).name)]
+    app_errors = sum(1 for f in app_findings if _sev(f) == "ERROR")
+
+    sem_badge = ("error" if app_errors else
+                 ("warning" if app_findings else "neutral"))
+    badge_txt = (f"{len(app_findings)} in app code"
+                 + (f" · {len(vendor_findings)} in libraries" if vendor_findings else "")) \
+                if sem_findings else 0
     parts.append(section("semgrep", "Semgrep — SAST / DOM Sinks",
-                         len(sem_findings), sem_badge, open_=bool(sem_findings)))
+                         badge_txt, sem_badge, open_=bool(app_findings)))
     if timeout_count:
         rule_list = ", ".join(timed_out_rules[:8]) + ("…" if len(timed_out_rules) > 8 else "")
         parts.append(f"<div class='notice warn'>⚠ {timeout_count} rule(s) timed out — "
@@ -7456,25 +7470,46 @@ def generate_report(target, output_dir, results):
     if not sem_findings:
         parts.append("<p class='empty'>No findings.</p>")
     else:
-        sem_errors   = [f for f in sem_findings if f.get("extra",{}).get("severity") == "ERROR"]
-        sem_warnings = [f for f in sem_findings if f.get("extra",{}).get("severity") == "WARNING"]
-        for level, items, bcls in [("ERROR", sem_errors, "error"), ("WARNING", sem_warnings, "warning")]:
-            if not items: continue
-            parts.append(sub(f"{level} ({len(items)})", len(items), bcls, open_=True))
-            parts.append("<table><thead><tr><th>Rule</th><th>File</th><th>Line</th><th>Message</th></tr></thead><tbody>")
+        def _sem_table(items):
+            out = ["<table><thead><tr><th>Rule</th><th>File</th><th>Line</th><th>Message</th></tr></thead><tbody>"]
             for f in items[:50]:
-                rule     = html_escape(f.get("check_id","?").split(".")[-1])
-                full_path = f.get("path","?")   # semgrep stores the full analysed path
-                fname    = Path(full_path).name
-                line     = html_escape(str(f.get("start",{}).get("line","?")))
-                msg      = f.get("extra",{}).get("message","")[:200].replace("\n"," ")
-                parts.append(f"<tr><td><code>{rule}</code></td>"
-                             + file_cell(fname, base_dir=str(Path(full_path).parent))
-                             + f"<td>{line}</td>"
-                             f"<td>{html_escape(msg)}</td></tr>")
+                rule      = html_escape(f.get("check_id","?").split(".")[-1])
+                full_path = f.get("path","?")
+                line      = html_escape(str(f.get("start",{}).get("line","?")))
+                msg       = f.get("extra",{}).get("message","")[:200].replace("\n"," ")
+                out.append(f"<tr><td><code>{rule}</code></td>"
+                           + file_cell(Path(full_path).name, base_dir=str(Path(full_path).parent))
+                           + f"<td>{line}</td><td>{html_escape(msg)}</td></tr>")
             if len(items) > 50:
-                parts.append(f"<tr><td colspan='4' class='empty'>{len(items)-50} more — see semgrep.json</td></tr>")
-            parts.append("</tbody></table>")
+                out.append(f"<tr><td colspan='4' class='empty'>{len(items)-50} more — see semgrep.json</td></tr>")
+            out.append("</tbody></table>")
+            return "".join(out)
+
+        # App-code findings first (the ones that matter), ERROR before WARNING.
+        if app_findings:
+            for level, bcls in [("ERROR", "error"), ("WARNING", "warning")]:
+                items = [f for f in app_findings if _sev(f) == level]
+                if not items: continue
+                parts.append(sub(f"App code — {level} ({len(items)})", len(items), bcls, open_=True))
+                parts.append(_sem_table(items))
+                parts.append(end_sub())
+        else:
+            parts.append("<p class='empty'>No findings in app code — all matches are in "
+                         "third-party/library bundles (see below).</p>")
+
+        # Vendor/library findings — collapsed, flagged as likely noise.
+        if vendor_findings:
+            parts.append(sub(f"Third-party / library code — likely noise ({len(vendor_findings)})",
+                             len(vendor_findings), "neutral", open_=False))
+            parts.append("<p class='empty'>Matches inside minified vendor bundles (React/webpack/"
+                         "analytics/etc.). These are almost always false positives — the rule "
+                         "patterns fire on framework boilerplate, not attacker-reachable sinks. "
+                         "Verify only if you have reason to.</p>")
+            for level in ("ERROR", "WARNING"):
+                items = [f for f in vendor_findings if _sev(f) == level]
+                if items:
+                    parts.append(f"<p class='empty'><strong>{level} ({len(items)})</strong></p>")
+                    parts.append(_sem_table(items))
             parts.append(end_sub())
     parts.append(end_section())
 
@@ -9789,9 +9824,18 @@ def main():
             sem_data = json.loads(semgrep_file.read_text(encoding="utf-8", errors="replace"))
             sem_results = sem_data.get("results", [])
             results["semgrep_total"] = len(sem_results)
+            # Count ERRORs in APP code only — ERRORs inside minified vendor bundles
+            # are almost always false positives, so the headline/priority signal
+            # should not be driven by them (full breakdown is in the report).
             results["semgrep_error"] = sum(
                 1 for r in sem_results
                 if r.get("extra", {}).get("severity") == "ERROR"
+                and not _looks_like_vendor_file(Path(r.get("path", "")).name)
+            )
+            results["semgrep_vendor_errors"] = sum(
+                1 for r in sem_results
+                if r.get("extra", {}).get("severity") == "ERROR"
+                and _looks_like_vendor_file(Path(r.get("path", "")).name)
             )
             results["semgrep_timeouts"] = sem_data.get("_timeout_count", 0)
         except Exception:
