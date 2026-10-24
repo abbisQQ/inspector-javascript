@@ -356,5 +356,23 @@ class VendorFileAndNoiseTests(unittest.TestCase):
         self.assertNotIn("todo", ijs._HIGH_VALUE_COMMENT_KINDS)
 
 
+class CrossOriginScriptTests(unittest.TestCase):
+    def test_app_cdn_bundles_are_kept(self):
+        for u in ["https://newsquad.b-cdn.net/assets/js/app.min.js",
+                  "https://d123.cloudfront.net/app.bundle.js",
+                  "https://cdn.jsdelivr.net/npm/jquery@3/dist/jquery.min.js",
+                  "https://assets.example.org/main.js"]:
+            self.assertFalse(ijs._is_third_party_script(u), u)   # kept = not third-party
+
+    def test_trackers_ads_widgets_are_dropped(self):
+        for u in ["https://www.google-analytics.com/analytics.js",
+                  "https://www.googletagmanager.com/gtag/js?id=X",
+                  "https://connect.facebook.net/en_US/fbevents.js",
+                  "https://www.google.com/recaptcha/api.js",
+                  "https://widget.intercom.io/widget/abc",
+                  "https://static.hotjar.com/c/hotjar.js"]:
+            self.assertTrue(ijs._is_third_party_script(u), u)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
