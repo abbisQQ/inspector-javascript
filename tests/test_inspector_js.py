@@ -343,6 +343,18 @@ class VendorFileAndNoiseTests(unittest.TestCase):
                   "subscribeNow.js", "components__emails__EmailComposer.js"]:
             self.assertFalse(ijs._looks_like_vendor_file(n), n)
 
+    def test_marker_inside_content_hash_is_not_vendor(self):
+        # Regression: a short marker (d3/vue/three) inside a hex hash must NOT
+        # flag an app bundle as vendor — doing so suppressed real leaks in it.
+        for n in ["47c0fe2c_main_4.36.6.910805d3879052e72e2c.js",   # 'd3' in hash
+                  "c30c6d7f_8780_4.36.6.910805d3879052e72e2c.bundle.js",
+                  "app.a1b2c3d3e4f5.js", "main.vue12345abc.js"]:
+            self.assertFalse(ijs._looks_like_vendor_file(n), n)
+        # real vendor files still detected after hash-stripping
+        for n in ["vendors.abc12345.js", "runtime.9f8e7d6c.js", "d3.v7.min.js",
+                  "three.module.js", "react.development.js"]:
+            self.assertTrue(ijs._looks_like_vendor_file(n), n)
+
     def test_noise_markers_cover_tooling_comments(self):
         for s in ["// eslint-disable-next-line react-internal/no-production-logging",
                   "// $FlowFixMe only called in DEV", "/* prettier-ignore */",

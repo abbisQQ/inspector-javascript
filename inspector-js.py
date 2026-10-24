@@ -3236,11 +3236,18 @@ _HIGH_VALUE_COMMENT_KINDS = frozenset({
 def _looks_like_vendor_file(name: str) -> bool:
     """Heuristic: is this JS file a third-party bundle/library (not app code)?
     Checks the filename (incl. the original name webpack/URL mode preserves) for
-    vendor markers or a known public npm package token."""
-    n = name.lower()
+    vendor markers or a known public npm package token.
+
+    Content hashes are stripped first: a short marker like "d3"/"vue"/"three"
+    would otherwise match inside a hex hash (e.g. main.910805d3879052.js) and
+    wrongly flag an app bundle as vendor — which, since vendor files are scanned
+    only for high-value leaks, would SUPPRESS real findings in that bundle.
+    """
+    # Drop hashed build segments (8+ hex chars) before any substring matching.
+    n = re.sub(r"[0-9a-f]{8,}", "", name.lower())
     if any(mark in n for mark in _VENDOR_FILE_MARKERS):
         return True
-    # tokens between separators, e.g. "47c0fe2c_react-vendor_4.36.6.js"
+    # tokens between separators, e.g. "react-vendor_4.36.6.js"
     return any(tok and _is_public_npm_package(tok) for tok in re.split(r"[^a-z0-9.@/-]+", n))
 
 # JSON files worth surfacing as exposures.
