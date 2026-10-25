@@ -6698,8 +6698,10 @@ def _has_critical_findings(results: dict) -> bool:
 def _ai_collect_secrets(output_dir: Path) -> list:
     """Gather the secret/token/credential CANDIDATES the scan produced — the
     high-false-positive outputs (TruffleHog, jsluice, extended-regex, config,
-    credential-mention comments). Each item is {source, kind, value, file}.
-    Values are sent to a LOCAL model only, so real values are fine."""
+    credential-mention comments) plus leaked host/URL references from comments
+    (dev/staging/OIDC/internal hosts, API bases, cloud metadata, service mesh).
+    Each item is {source, kind, value, file}. Values are sent to a LOCAL model
+    only, so real values are fine."""
     items = []
 
     def jsonl(name):
@@ -6731,10 +6733,14 @@ def _ai_collect_secrets(output_dir: Path) -> list:
         for r in jsonl(name):
             items.append({"source": src, "kind": r.get("kind", "?"),
                           "value": str(r.get("match", ""))[:200], "file": r.get("file", "")})
-    # credential mentions from comments
+    # Secret-ish + leaked-reference comments. credential_mention is a possible
+    # secret; the rest are leaked host/URL references (dev/staging/OIDC/internal,
+    # API base URLs, cloud metadata, service-mesh names) worth triaging too.
+    _ref_kinds = {"credential_mention", "env_reference", "internal_host",
+                  "api_base_url", "cloud_metadata", "service_mesh", "internal_url"}
     for r in jsonl("comments.json"):
-        if r.get("kind") == "credential_mention":
-            items.append({"source": "comment", "kind": "credential_mention",
+        if r.get("kind") in _ref_kinds:
+            items.append({"source": "comment", "kind": r.get("kind"),
                           "value": str(r.get("text", ""))[:200], "file": r.get("file", "")})
     # de-dupe by (kind, value)
     seen, uniq = set(), []
@@ -6752,8 +6758,9 @@ _AI_SECRET_SCHEMA = {
             "value": {"type": "string"},
             "service": {"type": "string"},
             "verdict": {"type": "string", "enum": [
-                "real_secret", "likely_false_positive", "placeholder_or_example",
-                "public_or_test_token", "unclear"]},
+                "real_secret", "sensitive_reference", "likely_false_positive",
+                "placeholder_or_example", "public_or_test_token",
+                "third_party_or_cdn", "unclear"]},
             "sensitivity": {"type": "string", "enum": ["high", "medium", "low", "none"]},
             "reasoning": {"type": "string"},
         }, "required": ["value", "verdict", "reasoning"]}},
@@ -6762,17 +6769,26 @@ _AI_SECRET_SCHEMA = {
 }
 
 _AI_SECRET_SYSTEM = (
-    "You are a secrets-analysis assistant. You are given secret/token/credential "
-    "CANDIDATES that a scanner extracted from a web app's JavaScript using "
-    "regex/entropy/TruffleHog — these have a HIGH false-positive rate. For EACH "
-    "candidate you are given (and ONLY those — never invent new ones), decide "
-    "whether it is a real, sensitive secret or a false positive: placeholders "
-    "(e.g. 'password', 'YOUR_API_KEY', 'changeme'), public/publishable or test "
-    "tokens (e.g. pk_test_, Google Maps browser keys), library constants, or "
-    "ordinary non-secret strings. Identify the service/type and the sensitivity "
-    "(high only for live, privately-scoped credentials). Echo back the exact "
-    "value you are judging. Be strict: most candidates are false positives — say "
-    "so when they are."
+    "You are a secrets-and-leaks analysis assistant. You are given CANDIDATES a "
+    "scanner extracted from a web app's JavaScript (regex/entropy/TruffleHog, plus "
+    "host/URL references pulled from comments and config) — these have a HIGH "
+    "false-positive rate. For EACH candidate you are given (and ONLY those — never "
+    "invent new ones), echo back the exact value and pick ONE verdict:\n"
+    "- real_secret: a genuine live, privately-scoped credential/token/key.\n"
+    "- sensitive_reference: a leaked host/URL worth probing — an internal, dev, "
+    "staging, QA, pre-prod, admin, OIDC/SSO, API-base, or cloud-metadata endpoint "
+    "that belongs to the target or its own infrastructure.\n"
+    "- public_or_test_token: a publishable/test token (pk_test_, Google Maps "
+    "browser key, etc.).\n"
+    "- placeholder_or_example: a template/placeholder (e.g. 'password', "
+    "'YOUR_API_KEY', '{api_key}', 'changeme').\n"
+    "- third_party_or_cdn: a reference to a public third-party/CDN/analytics host "
+    "not useful as a recon target (e.g. cdn.jsdelivr.net, google-analytics.com).\n"
+    "- likely_false_positive: a library constant or ordinary non-secret string.\n"
+    "- unclear: genuinely cannot tell.\n"
+    "Identify the service/type and the sensitivity (high only for live "
+    "credentials or clearly internal/non-prod endpoints). Be strict: most "
+    "candidates are false positives or noise — say so when they are."
 )
 
 
@@ -6845,15 +6861,20 @@ def ai_analyze_secrets(output_dir: Path, model: str, target: str) -> dict:
     out_file = output_dir / "ai-secrets.json"
     out_file.write_text(json.dumps({"assessments": kept}, ensure_ascii=False, indent=2), encoding="utf-8")
     real = [a for a in kept if a.get("verdict") == "real_secret"]
-    fp = [a for a in kept if a.get("verdict") in ("likely_false_positive", "placeholder_or_example")]
+    refs = [a for a in kept if a.get("verdict") == "sensitive_reference"]
+    fp = [a for a in kept if a.get("verdict") in ("likely_false_positive", "placeholder_or_example", "third_party_or_cdn")]
     Log.info(f"    {C.GREEN}[+]{C.RESET} {len(kept)} candidate(s) assessed: "
-             f"{len(real)} likely real, {len(fp)} likely false-positive"
+             f"{len(real)} likely-real secret(s), {len(refs)} sensitive reference(s), "
+             f"{len(fp)} noise/false-positive"
              + (f" ({dropped} hallucinated entr(ies) dropped)" if dropped else ""))
     if real:
         Log.info(f"    {C.YELLOW}[!]{C.RESET} {len(real)} candidate(s) flagged as real secrets — verify manually")
+    if refs:
+        Log.info(f"    {C.YELLOW}[!]{C.RESET} {len(refs)} leaked internal/dev reference(s) flagged — recon leads")
     Log.info(f"    {C.DIM}↳ model-generated — advisory, verify before trusting; see ai-secrets.json{C.RESET}")
     return {"ai_secrets_file": out_file, "ai_secrets_count": len(kept),
-            "ai_secrets_real": len(real), "ai_secrets_model": model}
+            "ai_secrets_real": len(real), "ai_secrets_refs": len(refs),
+            "ai_secrets_model": model}
 
 
 
@@ -7046,16 +7067,20 @@ def generate_report(target, output_dir, results):
             ai_rows = json.loads(Path(ai_file).read_text(encoding="utf-8", errors="replace")).get("assessments", [])
         except (OSError, ValueError):
             ai_rows = []
-        _vrank = {"real_secret": 0, "unclear": 1, "public_or_test_token": 2,
-                  "placeholder_or_example": 3, "likely_false_positive": 4}
-        ai_rows.sort(key=lambda x: _vrank.get(x.get("verdict", "unclear"), 1))
+        _vrank = {"real_secret": 0, "sensitive_reference": 1, "unclear": 2,
+                  "public_or_test_token": 3, "placeholder_or_example": 4,
+                  "third_party_or_cdn": 5, "likely_false_positive": 6}
+        ai_rows.sort(key=lambda x: _vrank.get(x.get("verdict", "unclear"), 2))
         real_n = sum(1 for a in ai_rows if a.get("verdict") == "real_secret")
+        ref_n = sum(1 for a in ai_rows if a.get("verdict") == "sensitive_reference")
+        notable = real_n + ref_n
         parts.append(section("ai-secrets",
-                             f"AI Secret Analysis — {html_escape(results.get('ai_secrets_model',''))} (local)",
-                             f"{len(ai_rows)} assessed · {real_n} likely real",
-                             "error" if real_n else "neutral", open_=bool(real_n)))
-        parts.append("<div class='notice'>🤖 Local model's verdict on the secret/token candidates "
-                     "(real vs false-positive). Produced on this host — values never left it. "
+                             f"AI Secret &amp; Leak Analysis — {html_escape(results.get('ai_secrets_model',''))} (local)",
+                             f"{len(ai_rows)} assessed · {real_n} likely-real secret(s) · {ref_n} sensitive reference(s)",
+                             "error" if notable else "neutral", open_=bool(notable)))
+        parts.append("<div class='notice'>🤖 Local model's verdict on the secret/token candidates and "
+                     "leaked host/URL references (real secret · sensitive internal/dev reference · noise). "
+                     "Produced on this host — values never left it. "
                      "<strong>Advisory only</strong> — verify before trusting; candidates are never "
                      "suppressed based on this.</div>")
         if ai_rows:
@@ -7063,7 +7088,8 @@ def generate_report(target, output_dir, results):
                          "<th>Sensitivity</th><th>Reasoning</th></tr></thead><tbody>")
             for a in ai_rows:
                 v = a.get("verdict", "unclear")
-                bcls = "error" if v == "real_secret" else ("warning" if v in ("unclear", "public_or_test_token") else "neutral")
+                bcls = ("error" if v in ("real_secret", "sensitive_reference")
+                        else ("warning" if v in ("unclear", "public_or_test_token") else "neutral"))
                 parts.append(
                     f"<tr><td><span class='badge {bcls}'>{html_escape(v.replace('_',' '))}</span></td>"
                     f"<td><code>{html_escape(str(a.get('value',''))[:80])}</code></td>"

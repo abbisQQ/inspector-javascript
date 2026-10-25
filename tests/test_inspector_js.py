@@ -416,12 +416,14 @@ class AiSecretCollectorTests(unittest.TestCase):
                 + json.dumps({"kind": "stripe-key", "match": "sk_live_abc123", "file": "app.js"}) + "\n")
             (base / "comments.json").write_text(
                 json.dumps({"kind": "credential_mention", "text": "apiKey=XYZ", "file": "app.js"}) + "\n"
+                + json.dumps({"kind": "env_reference", "text": "dev-api.internal.example", "file": "app.js"}) + "\n"
                 + json.dumps({"kind": "todo", "text": "not a secret", "file": "app.js"}) + "\n")
             cands = ijs._ai_collect_secrets(base)
             vals = {c["value"] for c in cands}
             self.assertIn("password", vals)              # placeholder candidate collected
             self.assertIn("sk_live_abc123", vals)        # regex secret collected
             self.assertTrue(any("apiKey=XYZ" in v for v in vals))  # credential_mention collected
+            self.assertTrue(any("dev-api.internal.example" in v for v in vals))  # leaked host reference collected
             self.assertFalse(any("not a secret" in v for v in vals))  # plain todo excluded
 
 
