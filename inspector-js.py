@@ -6895,14 +6895,6 @@ tr:hover { background: var(--hover); }
 }
 .notice.warn { background: var(--warning-bg); border-color: var(--warning); color: var(--warning); }
 .notice.err  { background: var(--error-bg);   border-color: var(--error);   color: var(--error); }
-.next-steps {
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 14px 18px;
-}
-.next-steps ol { margin: 0; padding-left: 20px; }
-.next-steps li { margin: 5px 0; color: var(--text-dim); font-size: 13px; }
 footer {
     margin-top: 48px;
     padding-top: 14px;
@@ -7188,6 +7180,16 @@ def generate_report(target, output_dir, results):
     def end_sub():
         return "</div></details>"
 
+    def finish_section(start_idx, keep):
+        """Close a section, or drop it entirely when it has no findings.
+        `start_idx` is len(parts) captured just before the section() header; when
+        `keep` is false everything appended since (header + body) is removed, so
+        empty sections leave no trace in the report."""
+        if keep:
+            parts.append(end_section())
+        else:
+            del parts[start_idx:]
+
     # ── compute nav highlight classes ────────────────────────────────
     def nav_cls(key, threshold=1):
         return "has-errors" if results.get(key, 0) >= threshold else ""
@@ -7246,11 +7248,6 @@ def generate_report(target, output_dir, results):
             bool(results.get("well_known_hits", 0))),
         ("#comments",    "Comments",      "",
             bool(results.get("comments_count", 0))),
-        ("#next-steps",  "Next Steps",    "",
-            _has_critical_findings(results)
-            or bool(results.get("endpoint_count", 0))
-            or bool(results.get("comments_count", 0))
-            or bool(results.get("well_known_harvested", 0))),
     ]
     for href, label, cls, show in nav_items:
         if not show:
@@ -7486,6 +7483,7 @@ def generate_report(target, output_dir, results):
     query_eps  = [e for e in in_scope if e.get("queryParams") and not is_open_redirect_candidate(e)]
 
     ep_badge_cls = "warning" if redir_eps else ""
+    _ep_idx = len(parts)
     parts.append(section("endpoints", "Endpoints",
                          f"{len(in_scope)} in scope · {len(out_scope)} external",
                          ep_badge_cls, open_=bool(endpoints)))
@@ -7594,7 +7592,7 @@ def generate_report(target, output_dir, results):
             parts.append("</tbody></table>")
             parts.append(end_sub())
 
-    parts.append(end_section())
+    finish_section(_ep_idx, bool(endpoints))
 
     # ── AJAX spider ──────────────────────────────────────────────────
     spider_rows = parse_jsonl(results.get("ajax_spider_file"))
@@ -7712,6 +7710,7 @@ def generate_report(target, output_dir, results):
     soft_n = len(live_groups["Soft-404 / catch-all (ignored)"][0])
     real_n = len(live_eps) - soft_n
     badge_txt = f"{real_n} real" + (f" · {soft_n} soft-404" if soft_n else "")
+    _live_idx = len(parts)
     parts.append(section("live", title, badge_txt, live_badge, open_=bool(live_eps)))
     if live_meta.get("truncated"):
         parts.append(
@@ -7759,7 +7758,7 @@ def generate_report(target, output_dir, results):
                 parts.append(f"<tr><td colspan='6' class='empty'>{len(items)-100} more — see live-endpoints.json</td></tr>")
             parts.append("</tbody></table>")
             parts.append(end_sub())
-    parts.append(end_section())
+    finish_section(_live_idx, bool(live_eps))
 
     # ── Mutated / unreferenced routes (opt-in --mutate-routes) ────────
     mut_rows = parse_jsonl(results.get("mutated_routes_file"))
@@ -7819,6 +7818,7 @@ def generate_report(target, output_dir, results):
 
     # ── HTTP Calls ───────────────────────────────────────────────────
     http_calls = parse_jsonl(results.get("http_calls_file"))
+    _http_idx = len(parts)
     parts.append(section("http-calls", "HTTP Calls (extracted from JS)",
                          len(http_calls) if http_calls else 0,
                          "warning" if http_calls else "neutral",
@@ -7849,13 +7849,14 @@ def generate_report(target, output_dir, results):
                 parts.append(f"<tr><td colspan='4' class='empty'>{len(items)-200} more — see http-calls.json</td></tr>")
             parts.append("</tbody></table>")
             parts.append(end_sub())
-    parts.append(end_section())
+    finish_section(_http_idx, bool(http_calls))
 
     # ── Secrets ──────────────────────────────────────────────────────
     jsluice_secs  = parse_jsonl(results.get("secrets_file"))
     th_cands      = parse_jsonl(results.get("trufflehog_file"))
     ext_secs      = parse_jsonl(results.get("secrets_ext_file"))
     total_secs    = len(jsluice_secs) + len(th_cands) + len(ext_secs)
+    _sec_idx = len(parts)
     parts.append(section("secrets", "Secret Candidates",
                          total_secs, "warning" if total_secs else "neutral",
                          open_=bool(total_secs)))
@@ -7915,7 +7916,7 @@ def generate_report(target, output_dir, results):
             parts.append("</tbody></table>")
             parts.append(end_sub())
 
-    parts.append(end_section())
+    finish_section(_sec_idx, bool(total_secs))
 
     # ── Semgrep ──────────────────────────────────────────────────────
     semgrep_file = results.get("semgrep_file")
@@ -7946,6 +7947,7 @@ def generate_report(target, output_dir, results):
     badge_txt = (f"{len(app_findings)} in app code"
                  + (f" · {len(vendor_findings)} in libraries" if vendor_findings else "")) \
                 if sem_findings else 0
+    _semgrep_idx = len(parts)
     parts.append(section("semgrep", "Semgrep — SAST / DOM Sinks",
                          badge_txt, sem_badge, open_=bool(app_findings)))
     if timeout_count:
@@ -7996,7 +7998,7 @@ def generate_report(target, output_dir, results):
                     parts.append(f"<p class='empty'><strong>{level} ({len(items)})</strong></p>")
                     parts.append(_sem_table(items))
             parts.append(end_sub())
-    parts.append(end_section())
+    finish_section(_semgrep_idx, bool(sem_findings))
 
     # ── Retire.js ────────────────────────────────────────────────────
     retire_file = results.get("retire_file")
@@ -8125,6 +8127,7 @@ def generate_report(target, output_dir, results):
 
     # ── Developer comments ───────────────────────────────────────────
     comments = parse_jsonl(results.get("comments_file"))
+    _comments_idx = len(parts)
     parts.append(section("comments", "Developer Comments",
                          len(comments), "warning" if comments else "neutral",
                          open_=bool(comments)))
@@ -8158,7 +8161,7 @@ def generate_report(target, output_dir, results):
                 parts.append(f"<tr><td colspan='3' class='empty'>{len(items)-30} more — see comments.json</td></tr>")
             parts.append("</tbody></table>")
             parts.append(end_sub())
-    parts.append(end_section())
+    finish_section(_comments_idx, bool(comments))
 
     # ── Dangling JS ──────────────────────────────────────────────────
     dangling = parse_jsonl(results.get("dangling_file"))
@@ -8461,51 +8464,6 @@ def generate_report(target, output_dir, results):
             parts.append(end_sub())
         parts.append(end_section())
 
-    # ── Next steps ───────────────────────────────────────────────────
-    # Only suggest actions for things that were actually found in this run.
-    # Avoids the "Triage 401/403 endpoints" suggestion on reports with zero
-    # 401/403 endpoints.
-    steps = []
-    auth_protected = sum(1 for e in live_eps if e.get("status") in (401, 403))
-    if auth_protected:
-        steps.append("Triage <strong>auth-protected (401/403)</strong> live endpoints — "
-                     "obtain a valid session/JWT before re-running with <code>-H Cookie/Authorization</code>")
-    if results.get("retire_vulns", 0):
-        steps.append("Review the <strong>Libraries</strong> section — verify CVE applicability "
-                     "against the actual deployment (not every CVE affects every config)")
-    if results.get("exposed_maps_count", 0):
-        steps.append("Mine the extracted <strong>sources/</strong> directory for hardcoded "
-                     "secrets, internal URLs, and API surface revealed by source maps")
-    if results.get("semgrep_error", 0):
-        steps.append("Manually verify <strong>Semgrep ERROR</strong> sinks — confirm "
-                     "user-controlled input reaches them (regex matches alone don't prove exploitability)")
-    if results.get("open_redirect_count", 0) or any(
-            is_open_redirect_candidate(e) for e in (endpoints or [])):
-        steps.append("Test <strong>open redirect</strong> candidates with an external URL — "
-                     "chain with XSS for phishing payloads")
-    if results.get("http_calls_count", 0):
-        steps.append("Cross-reference <strong>HTTP Calls</strong> against the endpoint list — "
-                     "some URLs are only reachable through the JS flow")
-    if results.get("secrets_ext_count", 0) or results.get("jsluice_secrets", 0):
-        steps.append("Inspect <strong>extended secret matches</strong> in raw JS before any "
-                     "live validation (check ROE — most are false positives, the rest are real)")
-    if results.get("well_known_leaks", 0):
-        steps.append("Confirm <strong>well-known leaks</strong> are real config files (not SPA "
-                     "catch-all responses) — pull each one directly with curl to verify")
-    if results.get("dangling_count", 0):
-        steps.append("Check <strong>dangling JS</strong> references for subdomain-takeover "
-                     "candidates (CNAMEd to expired CDN/storage bucket?)")
-    if results.get("well_known_harvested", 0) > 50:
-        steps.append(f"Fuzz the <strong>{results['well_known_harvested']} harvested URLs</strong> "
-                     "with Burp Intruder or ffuf for parameter-based auth/IDOR")
-
-    if steps:
-        parts.append(section("next-steps", "Next Steps", open_=True))
-        parts.append("<div class='next-steps'><ol>")
-        for s in steps:
-            parts.append(f"<li>{s}</li>")
-        parts.append("</ol></div>")
-        parts.append(end_section())
 
     # ── Footer ───────────────────────────────────────────────────────
     parts.append(
