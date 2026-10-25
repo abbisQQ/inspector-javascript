@@ -9,6 +9,7 @@ or, if you have pytest:
     python3 -m pytest tests/
 """
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -403,6 +404,68 @@ class LineLookupTests(unittest.TestCase):
 
     def test_empty_content(self):
         self.assertEqual(ijs.make_line_lookup("")(0), 1)
+
+
+
+class AiSecretCollectorTests(unittest.TestCase):
+    def test_collects_secret_candidates_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / "secrets-extended.json").write_text(
+                json.dumps({"kind": "weak-placeholder", "match": "password", "file": "main.js"}) + "\n"
+                + json.dumps({"kind": "stripe-key", "match": "sk_live_abc123", "file": "app.js"}) + "\n")
+            (base / "comments.json").write_text(
+                json.dumps({"kind": "credential_mention", "text": "apiKey=XYZ", "file": "app.js"}) + "\n"
+                + json.dumps({"kind": "env_reference", "text": "dev-api.internal.example", "file": "app.js"}) + "\n"
+                + json.dumps({"kind": "todo", "text": "not a secret", "file": "app.js"}) + "\n")
+            cands = ijs._ai_collect_secrets(base)
+            vals = {c["value"] for c in cands}
+            self.assertIn("password", vals)              # placeholder candidate collected
+            self.assertIn("sk_live_abc123", vals)        # regex secret collected
+            self.assertTrue(any("apiKey=XYZ" in v for v in vals))  # credential_mention collected
+            self.assertTrue(any("dev-api.internal.example" in v for v in vals))  # leaked host reference collected
+            self.assertFalse(any("not a secret" in v for v in vals))  # plain todo excluded
+
+
+class RegistrableDomainTests(unittest.TestCase):
+    def test_plain_and_subdomain(self):
+        self.assertEqual(ijs._registrable_domain("example.com"), "example.com")
+        self.assertEqual(ijs._registrable_domain("a.b.example.com"), "example.com")
+        self.assertEqual(ijs._registrable_domain("casino.pamestoixima.gr"), "pamestoixima.gr")
+
+    def test_multi_part_suffix(self):
+        self.assertEqual(ijs._registrable_domain("shop.example.co.uk"), "example.co.uk")
+        self.assertEqual(ijs._registrable_domain("example.co.uk"), "example.co.uk")
+
+
+class OriginClassifierTests(unittest.TestCase):
+    def setUp(self):
+        self.th = "casino.pamestoixima.gr"
+        self.reg = ijs._registrable_domain(self.th)
+
+    def test_cloud_backends(self):
+        for host, prov in [
+            ("mybucket.s3.amazonaws.com", "aws-s3"),
+            ("assets.s3.eu-west-1.amazonaws.com", "aws-s3"),
+            ("x.execute-api.us-east-1.amazonaws.com", "aws-apigw"),
+            ("app.azurewebsites.net", "azure-webapp"),
+            ("data.storage.googleapis.com", "gcs"),
+            ("proj.firebaseio.com", "firebase"),
+        ]:
+            self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg),
+                             ("cloud_backend", prov), host)
+
+    def test_target_owned_nonprod(self):
+        for host in ("napi-em-dev.pamestoixima.gr", "staging.pamestoixima.gr",
+                     "admin.pamestoixima.gr"):
+            self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg)[0],
+                             "nonprod_host", host)
+
+    def test_noise_excluded(self):
+        # prod host, CDN, and third-party dev hosts are NOT flagged by this stage
+        for host in ("www.pamestoixima.gr", "cdn.jsdelivr.net",
+                     "dev.visualwebsiteoptimizer.com", "staging.someother.com"):
+            self.assertIsNone(ijs._classify_origin_host(host, self.th, self.reg), host)
 
 
 if __name__ == "__main__":
