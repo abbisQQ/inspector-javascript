@@ -115,6 +115,9 @@ SEMGREP_OVERALL_TIMEOUT  = 900   # seconds for the whole semgrep run (15 min)
 # Retire.js
 RETIRE_TIMEOUT           = 180   # seconds
 
+# httpx technology fingerprint (optional)
+TECH_TIMEOUT             = 60    # seconds for the httpx probe
+
 # AI triage (local Ollama)
 OLLAMA_URL               = "http://localhost:11434"   # localhost only — data never leaves the box
 AI_MODEL_DEFAULT         = "qwen2.5:7b-instruct"      # fast; override with --ai-model
@@ -236,6 +239,8 @@ OPTIONAL_TOOLS = {
                    "git clone https://github.com/midoxnet/mapperplus && cd mapperplus && bash requirements.sh"),
     "sourcemapper": ("Required by mapperplus to extract sources from .map files",
                      "go install github.com/denandz/sourcemapper@latest"),
+    "httpx": ("Technology fingerprint — server/CMS/framework/CDN (ProjectDiscovery)",
+              "go install github.com/projectdiscovery/httpx/cmd/httpx@latest"),
 }
 
 
@@ -3219,6 +3224,97 @@ INFRA_PATTERNS = [
                 r"\s*[:=]\s*[\"'`](https?://[^\"'`\s]{4,200})[\"'`]"), "api_base_url"),
 ]
 
+# ---------- Origin / infrastructure exposure (Stage 5g) ----------
+# The app itself leaks its real backend — no CDN/WAF bypass needed, it's in the
+# shipped JS. Two high-signal categories the comment/INFRA scan doesn't cover:
+#   • cloud_backend — storage/PaaS/API-gateway hosts (the origin behind a CDN)
+#   • nonprod_host  — TARGET-OWNED dev/staging/qa/etc. subdomains (recon leads)
+# Both are deliberately low-false-positive (nonprod is gated on the target's own
+# registrable domain; generic third-party dev hosts are left to Stage 8b).
+
+# Any http(s) or protocol-relative URL — host is parsed out with urlparse after.
+_ORIGIN_URL_RE = re.compile(r"(?:https?:)?//[A-Za-z0-9.\-]+(?::\d{2,5})?(?:/[^\s\"'`<>()]*)?")
+
+# Multi-part public suffixes so registrable-domain derivation keeps the right
+# number of labels (no tldextract dependency — this script stays self-contained).
+_MULTI_PART_SUFFIXES = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "co.jp", "or.jp", "ne.jp",
+    "com.au", "net.au", "org.au", "co.nz", "com.br", "com.cn", "com.tr",
+    "co.in", "co.za", "com.mx", "com.ar", "co.kr", "com.sg", "com.hk", "gr.com",
+}
+
+# Non-production / internal subdomain markers (matched as a whole label or a
+# dash/underscore-delimited token, so "napi-em-dev" and "dev-api" both hit).
+_NONPROD_RE = re.compile(
+    r"(?:^|[.\-_])(?:dev|develop|development|staging|stage|stg|qa|uat|test|testing"
+    r"|preprod|preproduction|sandbox|sbx|demo|beta|internal|intranet|admin|mgmt"
+    r"|jenkins|gitlab|grafana|kibana|vpn|edge)(?:[.\-_]|$)", re.IGNORECASE)
+
+
+def _registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (eTLD+1) without external data. Handles the
+    common multi-part suffixes above; falls back to the last two labels."""
+    host = (host or "").lower().strip(".")
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    if ".".join(parts[-2:]) in _MULTI_PART_SUFFIXES and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _url_host(u: str) -> str:
+    try:
+        return (urlparse("https:" + u if u.startswith("//") else u).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _cloud_provider(host: str) -> str:
+    """Return a short provider label if `host` is a cloud backend/storage/PaaS
+    origin, else "". CDNs (cloudfront/jsdelivr/…) are intentionally excluded —
+    those are the front door, not the origin."""
+    h = host.lower()
+    if h.endswith(".amazonaws.com") or h == "amazonaws.com":
+        if ".s3." in h or ".s3-" in h or h.startswith("s3.") or h.startswith("s3-"):
+            return "aws-s3"
+        if ".execute-api." in h:
+            return "aws-apigw"
+        if h.endswith(".elb.amazonaws.com"):
+            return "aws-elb"
+        return "aws"
+    for suf, prov in (
+        (".blob.core.windows.net", "azure-blob"),
+        (".azurewebsites.net", "azure-webapp"),
+        (".storage.googleapis.com", "gcs"),
+        ("storage.googleapis.com", "gcs"),
+        (".appspot.com", "gcp-appengine"),
+        (".run.app", "gcp-cloudrun"),
+        (".firebaseio.com", "firebase"),
+        (".firebaseapp.com", "firebase"),
+        (".r2.cloudflarestorage.com", "cloudflare-r2"),
+        (".digitaloceanspaces.com", "do-spaces"),
+        (".herokuapp.com", "heroku"),
+    ):
+        if h == suf.lstrip(".") or h.endswith(suf):
+            return prov
+    return ""
+
+
+def _classify_origin_host(host: str, target_host: str, reg: str):
+    """(kind, detail) for an interesting origin/infra host, else None."""
+    prov = _cloud_provider(host)
+    if prov:
+        return ("cloud_backend", prov)
+    # Target-owned non-production subdomain (shares the registrable domain but is
+    # not the public host we're scanning).
+    if reg and host != target_host and (host == reg or host.endswith("." + reg)):
+        subpart = host[: -len(reg)].rstrip(".")
+        if subpart and _NONPROD_RE.search(subpart):
+            return ("nonprod_host", "non-production")
+    return None
+
+
 # Cap per finding-kind so one noisy bundle can't flood the report.
 METADATA_FINDING_CAP = 60
 
@@ -3847,6 +3943,157 @@ def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_r
         "swagger_endpoints": len(swagger_endpoints),
         "comments": len(comment_findings),
     }
+
+
+def detect_origin_exposure(js_clean, output_dir, target):
+    """Stage 5g — mine the collected JS/sources for the app's own real backend:
+    cloud storage/PaaS/API-gateway origins and TARGET-OWNED non-production
+    subdomains. These are disclosed by the client itself (no CDN/WAF bypass) and
+    make strong recon leads. Writes origin-exposure.json."""
+    stage_header("5g", "Origin & infrastructure exposure")
+
+    target_host = (urlparse(target).hostname or target or "").lower()
+    reg = _registrable_domain(target_host)
+
+    sources_dir = output_dir / "sources"
+    scan_bases = [js_clean]
+    if sources_dir.exists() and any(sources_dir.iterdir()):
+        scan_bases.append(sources_dir)
+
+    findings, seen, kind_counts = [], set(), {}
+    for base in scan_bases:
+        for jsfile in iter_js_files(base):
+            try:
+                content = jsfile.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            line_of = make_line_lookup(content)
+            for m in _ORIGIN_URL_RE.finditer(content):
+                host = _url_host(m.group(0))
+                if not host:
+                    continue
+                rec = _classify_origin_host(host, target_host, reg)
+                if not rec:
+                    continue
+                kind, detail = rec
+                key = (kind, host)
+                if key in seen or kind_counts.get(kind, 0) >= METADATA_FINDING_CAP:
+                    continue
+                seen.add(key)
+                kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                findings.append({
+                    "kind": kind, "host": host, "detail": detail,
+                    "url": m.group(0)[:200],
+                    "file": jsfile.relative_to(base).as_posix(),
+                    "line": line_of(m.start()),
+                    "target_owned": kind == "nonprod_host",
+                })
+
+    out_file = None
+    cloud_n = sum(1 for r in findings if r["kind"] == "cloud_backend")
+    nonprod_n = sum(1 for r in findings if r["kind"] == "nonprod_host")
+    if findings:
+        out_file = output_dir / "origin-exposure.json"
+        with out_file.open("w") as f:
+            for r in findings:
+                f.write(json.dumps(r) + "\n")
+        Log.info(f"    {C.GREEN}[+]{C.RESET} {len(findings)} origin/infra host(s): "
+                 f"{cloud_n} cloud backend(s), {nonprod_n} target-owned non-prod host(s)")
+        if nonprod_n:
+            Log.info(f"    {C.YELLOW}[!]{C.RESET} {nonprod_n} non-production host(s) on the "
+                     f"target's own domain — recon leads")
+    else:
+        Log.info("    [-] No cloud-backend or non-prod host exposure found in the JS")
+
+    return {"origin_exposure_file": out_file, "origin_exposure_count": len(findings),
+            "origin_cloud_count": cloud_n, "origin_nonprod_count": nonprod_n}
+
+
+def _is_projectdiscovery_httpx() -> bool:
+    """`httpx` is an unfortunate name clash: ProjectDiscovery's Go fingerprinter
+    AND the Python HTTP library's CLI both install as `httpx`. Only the former
+    supports -td/-json. Probe `-version` to tell them apart (the Python CLI errors
+    on the flag; the Go tool prints a projectdiscovery banner)."""
+    if not find_tool("httpx"):
+        return False
+    res = run([*tool_cmd("httpx"), "-version"], check=False, capture=True,
+              quiet=True, timeout=10)
+    blob = ((getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")).lower()
+    if "no such option" in blob:          # Python httpx CLI rejecting -version
+        return False
+    return "projectdiscovery" in blob or bool(re.search(r"\bv?\d+\.\d+\.\d+\b", blob))
+
+
+def run_tech_detect(target, output_dir, headers, proxy=None):
+    """Stage 0b — fingerprint SERVER-side technologies with httpx -td (Wappalyzer
+    fingerprints): web server, CMS, frameworks, CDN/WAF. Complements the
+    client-side framework detection done from the JS itself. URL mode only;
+    optional — skipped cleanly if the ProjectDiscovery httpx isn't installed."""
+    stage_header("0b", "Technology fingerprint (httpx)")
+
+    if not _is_projectdiscovery_httpx():
+        hint = ("found a different `httpx` (the Python CLI?)" if find_tool("httpx")
+                else "httpx not installed")
+        Log.info(f"    [-] {hint} — skipping "
+                 "(go install github.com/projectdiscovery/httpx/cmd/httpx@latest)")
+        return {"tech_file": None, "tech_count": 0}
+
+    cmd = [
+        *tool_cmd("httpx"),
+        "-u", target,
+        "-json", "-td", "-title", "-server", "-status-code",
+        "-cdn", "-ip", "-location", "-silent", "-no-color",
+        "-timeout", "15",
+    ]
+    for h in headers:
+        cmd += ["-H", h]
+    if proxy:
+        cmd += ["-http-proxy", proxy]
+
+    res = run(cmd, check=False, capture=True, quiet=True, timeout=TECH_TIMEOUT)
+    stdout = getattr(res, "stdout", "") or ""
+    rec = None
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+            break
+        except ValueError:
+            continue
+    if not isinstance(rec, dict):
+        Log.info("    [-] No fingerprint produced (is this the ProjectDiscovery httpx? "
+                 "the Python 'httpx' CLI is a different tool)")
+        return {"tech_file": None, "tech_count": 0}
+
+    techs = rec.get("tech") or rec.get("technologies") or []
+    summary = {
+        "url": rec.get("url", target),
+        "status_code": rec.get("status_code") or rec.get("status-code"),
+        "webserver": rec.get("webserver") or rec.get("web_server") or "",
+        "title": rec.get("title", ""),
+        "cdn": rec.get("cdn_name") or rec.get("cdn") or "",
+        "cdn_type": rec.get("cdn_type", ""),
+        "ip": rec.get("host") or (rec.get("a") or [""])[0] if rec.get("a") else rec.get("host", ""),
+        "location": rec.get("location", ""),
+        "tech": techs,
+    }
+    out_file = output_dir / "tech.json"
+    out_file.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    bits = []
+    if summary["webserver"]:
+        bits.append(f"server={summary['webserver']}")
+    if summary["cdn"]:
+        bits.append(f"cdn={summary['cdn']}")
+    if techs:
+        bits.append(f"{len(techs)} tech")
+    Log.info(f"    {C.GREEN}[+]{C.RESET} fingerprint: "
+             + (", ".join(bits) if bits else "no distinctive tech detected"))
+    if techs:
+        Log.verbose("    ↳ " + ", ".join(str(t) for t in techs[:12]))
+    return {"tech_file": out_file, "tech_count": len(techs)}
 
 
 # ---------- Stage 5d: Wayback Machine historical map discovery ----------
@@ -6742,6 +6989,11 @@ def _ai_collect_secrets(output_dir: Path) -> list:
         if r.get("kind") in _ref_kinds:
             items.append({"source": "comment", "kind": r.get("kind"),
                           "value": str(r.get("text", ""))[:200], "file": r.get("file", "")})
+    # Origin/infra hosts the app leaks about itself (Stage 5g) — cloud backends
+    # and target-owned non-prod hosts are exactly the references 8b should judge.
+    for r in jsonl("origin-exposure.json"):
+        items.append({"source": "origin", "kind": r.get("kind", "origin_host"),
+                      "value": str(r.get("host", ""))[:200], "file": r.get("file", "")})
     # de-dupe by (kind, value)
     seen, uniq = set(), []
     for it in items:
@@ -6984,6 +7236,11 @@ def generate_report(target, output_dir, results):
             bool(results.get("retire_vulns", 0))),
         ("#maps",        "Maps",          "has-findings" if results.get("exposed_maps_count",0) else "",
             bool(results.get("exposed_maps_count", 0))),
+        ("#tech",        "Tech",          "",
+            bool(results.get("tech_count", 0))),
+        ("#origin",      "Origin",        "has-errors" if results.get("origin_nonprod_count",0)
+            else ("has-findings" if results.get("origin_exposure_count", 0) else ""),
+            bool(results.get("origin_exposure_count", 0))),
         ("#well-known",  "Well-known",    "has-error" if results.get("well_known_leaks",0)
             else ("has-findings" if results.get("well_known_hits", 0) else ""),
             bool(results.get("well_known_hits", 0))),
@@ -7075,7 +7332,7 @@ def generate_report(target, output_dir, results):
         ref_n = sum(1 for a in ai_rows if a.get("verdict") == "sensitive_reference")
         notable = real_n + ref_n
         parts.append(section("ai-secrets",
-                             f"AI Secret &amp; Leak Analysis — {html_escape(results.get('ai_secrets_model',''))} (local)",
+                             f"AI Secret & Leak Analysis — {results.get('ai_secrets_model','')} (local)",
                              f"{len(ai_rows)} assessed · {real_n} likely-real secret(s) · {ref_n} sensitive reference(s)",
                              "error" if notable else "neutral", open_=bool(notable)))
         parts.append("<div class='notice'>🤖 Local model's verdict on the secret/token candidates and "
@@ -7805,6 +8062,66 @@ def generate_report(target, output_dir, results):
     else:
         parts.append(f"<p class='empty'>{len(retire_libs)} libraries detected — none with known vulnerabilities.</p>")
     parts.append(end_section())
+
+    # ── Technology fingerprint (httpx) ───────────────────────────────
+    tech_file = results.get("tech_file")
+    if tech_file and Path(tech_file).exists():
+        try:
+            tech = json.loads(Path(tech_file).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            tech = {}
+        techs = tech.get("tech") or []
+        parts.append(section("tech", "Technology Fingerprint",
+                             f"{len(techs)} tech", "neutral", open_=bool(techs)))
+        parts.append("<p class='empty'>Server-side stack detected with <code>httpx -td</code> "
+                     "(Wappalyzer fingerprints) — complements the client-side framework detection "
+                     "from the JS. Useful for mapping attack surface and spotting dated components.</p>")
+        meta_rows = [
+            ("URL", tech.get("url", "")),
+            ("Status", tech.get("status_code", "")),
+            ("Web server", tech.get("webserver", "")),
+            ("CDN / WAF", (f"{tech.get('cdn','')} ({tech.get('cdn_type','')})"
+                           if tech.get("cdn") and tech.get("cdn_type") else tech.get("cdn", ""))),
+            ("IP", tech.get("ip", "")),
+            ("Title", tech.get("title", "")),
+        ]
+        parts.append("<table><tbody>")
+        for label, val in meta_rows:
+            if val not in ("", None):
+                parts.append(f"<tr><th style='text-align:left'>{html_escape(label)}</th>"
+                             f"<td><code>{html_escape(str(val))}</code></td></tr>")
+        parts.append("</tbody></table>")
+        if techs:
+            badges = " ".join(f"<span class='badge neutral'>{html_escape(str(t))}</span>" for t in techs)
+            parts.append(f"<div style='margin-top:.6em;line-height:2'>{badges}</div>")
+        parts.append(end_section())
+
+    # ── Origin & infrastructure exposure ─────────────────────────────
+    origin = parse_jsonl(results.get("origin_exposure_file"))
+    if origin:
+        nonprod_n = sum(1 for o in origin if o.get("kind") == "nonprod_host")
+        parts.append(section("origin", "Origin & Infrastructure Exposure",
+                             f"{len(origin)} host(s)", "error" if nonprod_n else "warning",
+                             open_=True))
+        parts.append("<p class='empty'>Real backend hosts the app leaks about <em>itself</em> in its "
+                     "shipped JS — no CDN/WAF bypass involved. <strong>cloud backend</strong> = "
+                     "storage/PaaS/API-gateway origins; <strong>nonprod host</strong> = the target's own "
+                     "dev/staging/QA subdomains (strong recon leads). See also internal IPs / cloud "
+                     "metadata / service-mesh refs under Developer Comments.</p>")
+        parts.append("<table><thead><tr><th>Kind</th><th>Host</th><th>Detail</th>"
+                     "<th>File</th><th>Line</th></tr></thead><tbody>")
+        _okinds = {"nonprod_host": "error", "cloud_backend": "warning"}
+        for o in sorted(origin, key=lambda x: 0 if x.get("kind") == "nonprod_host" else 1)[:80]:
+            k = o.get("kind", "?")
+            bcls = _okinds.get(k, "neutral")
+            parts.append(
+                f"<tr><td><span class='badge {bcls}'>{html_escape(k.replace('_',' '))}</span></td>"
+                f"<td><code>{html_escape(o.get('host',''))}</code></td>"
+                f"<td>{html_escape(str(o.get('detail','')))}</td>"
+                + file_cell(o.get('file', ''))
+                + f"<td>{html_escape(str(o.get('line','?')))}</td></tr>")
+        parts.append("</tbody></table>")
+        parts.append(end_section())
 
     # ── Developer comments ───────────────────────────────────────────
     comments = parse_jsonl(results.get("comments_file"))
@@ -9987,6 +10304,9 @@ def main():
             Log.warn("--headless on macOS hits a known upstream Katana hang; "
                      "consider running without it (HTML <script> scrape fallback "
                      "covers most non-SPA sites).")
+        # Stage 0b — technology fingerprint (optional; server-side tech/CDN)
+        results.update(run_tech_detect(args.url, output_dir, args.header, proxy=args.proxy))
+
         # Stage 1
         katana_out, url_count = run_katana(
             args.url, output_dir, args.header, args.depth, args.rate_limit,
@@ -10159,6 +10479,10 @@ def main():
     results["swagger_endpoints_count"] = meta["swagger_endpoints"]
     results["comments_count"] = meta["comments"]
 
+    # Stage 5g — Origin & infrastructure exposure (cloud backends + target-owned
+    # non-prod hosts the app leaks about itself). Works in URL and --dir mode.
+    results.update(detect_origin_exposure(js_clean, output_dir, target_label))
+
     # Merge Swagger-discovered endpoints into the main endpoints file
     swagger_file = meta.get("swagger_endpoints_file")
     if swagger_file and swagger_file.exists() and endpoints and endpoints.exists():
@@ -10320,6 +10644,12 @@ def main():
             f"{results['recon_downloaded']} extra file(s) pulled by active-recon "
             f"(+{results.get('recon_js_added', 0)} JS, "
             f"+{results.get('recon_map_added', 0)} maps into pipeline)"
+        )
+    if results.get("origin_exposure_count", 0) > 0:
+        priorities.append(
+            f"{results['origin_exposure_count']} origin/infra host(s) leaked in JS "
+            f"({results.get('origin_cloud_count', 0)} cloud backend, "
+            f"{results.get('origin_nonprod_count', 0)} target-owned non-prod) — see origin-exposure.json"
         )
 
     if priorities:

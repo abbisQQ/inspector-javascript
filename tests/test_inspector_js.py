@@ -427,5 +427,46 @@ class AiSecretCollectorTests(unittest.TestCase):
             self.assertFalse(any("not a secret" in v for v in vals))  # plain todo excluded
 
 
+class RegistrableDomainTests(unittest.TestCase):
+    def test_plain_and_subdomain(self):
+        self.assertEqual(ijs._registrable_domain("example.com"), "example.com")
+        self.assertEqual(ijs._registrable_domain("a.b.example.com"), "example.com")
+        self.assertEqual(ijs._registrable_domain("casino.pamestoixima.gr"), "pamestoixima.gr")
+
+    def test_multi_part_suffix(self):
+        self.assertEqual(ijs._registrable_domain("shop.example.co.uk"), "example.co.uk")
+        self.assertEqual(ijs._registrable_domain("example.co.uk"), "example.co.uk")
+
+
+class OriginClassifierTests(unittest.TestCase):
+    def setUp(self):
+        self.th = "casino.pamestoixima.gr"
+        self.reg = ijs._registrable_domain(self.th)
+
+    def test_cloud_backends(self):
+        for host, prov in [
+            ("mybucket.s3.amazonaws.com", "aws-s3"),
+            ("assets.s3.eu-west-1.amazonaws.com", "aws-s3"),
+            ("x.execute-api.us-east-1.amazonaws.com", "aws-apigw"),
+            ("app.azurewebsites.net", "azure-webapp"),
+            ("data.storage.googleapis.com", "gcs"),
+            ("proj.firebaseio.com", "firebase"),
+        ]:
+            self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg),
+                             ("cloud_backend", prov), host)
+
+    def test_target_owned_nonprod(self):
+        for host in ("napi-em-dev.pamestoixima.gr", "staging.pamestoixima.gr",
+                     "admin.pamestoixima.gr"):
+            self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg)[0],
+                             "nonprod_host", host)
+
+    def test_noise_excluded(self):
+        # prod host, CDN, and third-party dev hosts are NOT flagged by this stage
+        for host in ("www.pamestoixima.gr", "cdn.jsdelivr.net",
+                     "dev.visualwebsiteoptimizer.com", "staging.someother.com"):
+            self.assertIsNone(ijs._classify_origin_host(host, self.th, self.reg), host)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
