@@ -115,6 +115,12 @@ SEMGREP_OVERALL_TIMEOUT  = 900   # seconds for the whole semgrep run (15 min)
 # Retire.js
 RETIRE_TIMEOUT           = 180   # seconds
 
+# AI triage (local Ollama)
+OLLAMA_URL               = "http://localhost:11434"   # localhost only — data never leaves the box
+AI_MODEL_DEFAULT         = "qwen2.5:7b-instruct"      # fast; override with --ai-model
+AI_TRIAGE_TIMEOUT        = 300   # seconds for the model to respond
+AI_MAX_PER_CATEGORY      = 40    # cap findings per category sent to the model
+
 # TruffleHog
 TRUFFLEHOG_TIMEOUT       = 300   # seconds
 
@@ -6687,6 +6693,170 @@ def _has_critical_findings(results: dict) -> bool:
     ))
 
 
+# ---------- Stage 8b: AI secret analysis (local Ollama, opt-in) ----------
+
+def _ai_collect_secrets(output_dir: Path) -> list:
+    """Gather the secret/token/credential CANDIDATES the scan produced — the
+    high-false-positive outputs (TruffleHog, jsluice, extended-regex, config,
+    credential-mention comments). Each item is {source, kind, value, file}.
+    Values are sent to a LOCAL model only, so real values are fine."""
+    items = []
+
+    def jsonl(name):
+        p = output_dir / name
+        if not p.exists():
+            return []
+        out = []
+        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if ln:
+                try: out.append(json.loads(ln))
+                except ValueError: pass
+        return out
+
+    # TruffleHog (filesystem --json): DetectorName / Raw / Verified / file
+    for r in jsonl("trufflehog.json"):
+        meta = (r.get("SourceMetadata", {}) or {}).get("Data", {}) or {}
+        fpath = (meta.get("Filesystem", {}) or {}).get("file", "")
+        items.append({"source": "trufflehog", "kind": r.get("DetectorName", "?"),
+                      "value": (r.get("Raw") or r.get("Redacted") or "")[:200],
+                      "verified": r.get("Verified"), "file": Path(fpath).name})
+    # jsluice secrets
+    for r in jsonl("secrets.json"):
+        items.append({"source": "jsluice", "kind": r.get("kind", "?"),
+                      "value": str(r.get("data") or r.get("match") or r.get("value") or "")[:200],
+                      "file": Path(str(r.get("filename", "")) or "").name})
+    # extended-regex + config secrets
+    for name, src in (("secrets-extended.json", "regex"), ("config-secrets.json", "config")):
+        for r in jsonl(name):
+            items.append({"source": src, "kind": r.get("kind", "?"),
+                          "value": str(r.get("match", ""))[:200], "file": r.get("file", "")})
+    # credential mentions from comments
+    for r in jsonl("comments.json"):
+        if r.get("kind") == "credential_mention":
+            items.append({"source": "comment", "kind": "credential_mention",
+                          "value": str(r.get("text", ""))[:200], "file": r.get("file", "")})
+    # de-dupe by (kind, value)
+    seen, uniq = set(), []
+    for it in items:
+        k = (it["kind"], it["value"])
+        if it["value"] and k not in seen:
+            seen.add(k); uniq.append(it)
+    return uniq[:60]
+
+
+_AI_SECRET_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "assessments": {"type": "array", "items": {"type": "object", "properties": {
+            "value": {"type": "string"},
+            "service": {"type": "string"},
+            "verdict": {"type": "string", "enum": [
+                "real_secret", "likely_false_positive", "placeholder_or_example",
+                "public_or_test_token", "unclear"]},
+            "sensitivity": {"type": "string", "enum": ["high", "medium", "low", "none"]},
+            "reasoning": {"type": "string"},
+        }, "required": ["value", "verdict", "reasoning"]}},
+    },
+    "required": ["assessments"],
+}
+
+_AI_SECRET_SYSTEM = (
+    "You are a secrets-analysis assistant. You are given secret/token/credential "
+    "CANDIDATES that a scanner extracted from a web app's JavaScript using "
+    "regex/entropy/TruffleHog — these have a HIGH false-positive rate. For EACH "
+    "candidate you are given (and ONLY those — never invent new ones), decide "
+    "whether it is a real, sensitive secret or a false positive: placeholders "
+    "(e.g. 'password', 'YOUR_API_KEY', 'changeme'), public/publishable or test "
+    "tokens (e.g. pk_test_, Google Maps browser keys), library constants, or "
+    "ordinary non-secret strings. Identify the service/type and the sensitivity "
+    "(high only for live, privately-scoped credentials). Echo back the exact "
+    "value you are judging. Be strict: most candidates are false positives — say "
+    "so when they are."
+)
+
+
+def ai_analyze_secrets(output_dir: Path, model: str, target: str) -> dict:
+    """Stage 8b (opt-in) — ask a LOCAL Ollama model to judge the secret/token
+    candidates (real vs false positive, service, sensitivity). Fully local:
+    POSTed to localhost only. Advisory — never auto-suppresses anything."""
+    stage_header("8b", "AI secret analysis (local Ollama)")
+
+    try:
+        tags_raw = fetch_url(f"{OLLAMA_URL}/api/tags", timeout=5)[1]
+        have = {m.get("name", "") for m in (json.loads(tags_raw).get("models", []) if tags_raw else [])}
+    except Exception:
+        have = None
+    if have is None:
+        Log.info(f"    [-] Ollama not reachable at {OLLAMA_URL} — skipping (run `ollama serve`)")
+        return {"ai_secrets_file": None, "ai_secrets_count": 0}
+    if model not in have and f"{model}:latest" not in have and not any(m.startswith(model) for m in have):
+        Log.warn(f"model '{model}' not pulled (have: {', '.join(sorted(have)) or 'none'}); "
+                 f"trying anyway — `ollama pull {model}` if this fails")
+
+    cands = _ai_collect_secrets(output_dir)
+    if not cands:
+        Log.info("    [-] No secret/token candidates to analyse")
+        return {"ai_secrets_file": None, "ai_secrets_count": 0}
+    Log.info(f"    {C.DIM}↳ sending {len(cands)} secret candidate(s) to {model} "
+             f"(local — values never leave this host){C.RESET}")
+
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _AI_SECRET_SYSTEM},
+            {"role": "user", "content": f"Target: {target}\n\nSecret candidates (JSON):\n"
+                                        + json.dumps(cands, ensure_ascii=False)},
+        ],
+        "format": _AI_SECRET_SCHEMA,
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=AI_TRIAGE_TIMEOUT) as resp:
+            content = json.loads(resp.read().decode("utf-8", errors="replace")).get("message", {}).get("content", "")
+    except Exception as exc:
+        Log.warn(f"AI secret analysis failed: {type(exc).__name__}: {str(exc)[:120]}")
+        return {"ai_secrets_file": None, "ai_secrets_count": 0}
+
+    parsed = None
+    for cand in (content, content[content.find("{"):content.rfind("}") + 1] if "{" in content else ""):
+        try:
+            parsed = json.loads(cand); break
+        except ValueError:
+            continue
+    if not isinstance(parsed, dict) or "assessments" not in parsed:
+        Log.warn("AI secret analysis returned unparseable output — skipping")
+        return {"ai_secrets_file": None, "ai_secrets_count": 0}
+
+    # Anti-hallucination: keep only assessments whose value matches a real
+    # candidate we sent (prevents the model inventing entries).
+    sent_values = {c["value"] for c in cands}
+
+    def _matches(v):
+        v = (v or "").strip()
+        return bool(v) and (v in sent_values or any(v in s or s in v for s in sent_values))
+    kept = [a for a in parsed.get("assessments", []) if _matches(a.get("value"))]
+    dropped = len(parsed.get("assessments", [])) - len(kept)
+
+    out_file = output_dir / "ai-secrets.json"
+    out_file.write_text(json.dumps({"assessments": kept}, ensure_ascii=False, indent=2), encoding="utf-8")
+    real = [a for a in kept if a.get("verdict") == "real_secret"]
+    fp = [a for a in kept if a.get("verdict") in ("likely_false_positive", "placeholder_or_example")]
+    Log.info(f"    {C.GREEN}[+]{C.RESET} {len(kept)} candidate(s) assessed: "
+             f"{len(real)} likely real, {len(fp)} likely false-positive"
+             + (f" ({dropped} hallucinated entr(ies) dropped)" if dropped else ""))
+    if real:
+        Log.info(f"    {C.YELLOW}[!]{C.RESET} {len(real)} candidate(s) flagged as real secrets — verify manually")
+    Log.info(f"    {C.DIM}↳ model-generated — advisory, verify before trusting; see ai-secrets.json{C.RESET}")
+    return {"ai_secrets_file": out_file, "ai_secrets_count": len(kept),
+            "ai_secrets_real": len(real), "ai_secrets_model": model}
+
+
+
 def generate_report(target, output_dir, results):
     stage_header(9, "Generating HTML report")
     report_path = output_dir / "report.html"
@@ -6867,6 +7037,40 @@ def generate_report(target, output_dir, results):
                      else "<span class='badge warning'>•</span>")
             parts.append(f"<li>{badge} <a href='{anchor}'>{html_escape(msg)}</a></li>")
         parts.append("</ul>")
+        parts.append(end_section())
+
+    # ── AI secret analysis (local model, advisory) ───────────────────
+    ai_file = results.get("ai_secrets_file")
+    if ai_file and Path(ai_file).exists():
+        try:
+            ai_rows = json.loads(Path(ai_file).read_text(encoding="utf-8", errors="replace")).get("assessments", [])
+        except (OSError, ValueError):
+            ai_rows = []
+        _vrank = {"real_secret": 0, "unclear": 1, "public_or_test_token": 2,
+                  "placeholder_or_example": 3, "likely_false_positive": 4}
+        ai_rows.sort(key=lambda x: _vrank.get(x.get("verdict", "unclear"), 1))
+        real_n = sum(1 for a in ai_rows if a.get("verdict") == "real_secret")
+        parts.append(section("ai-secrets",
+                             f"AI Secret Analysis — {html_escape(results.get('ai_secrets_model',''))} (local)",
+                             f"{len(ai_rows)} assessed · {real_n} likely real",
+                             "error" if real_n else "neutral", open_=bool(real_n)))
+        parts.append("<div class='notice'>🤖 Local model's verdict on the secret/token candidates "
+                     "(real vs false-positive). Produced on this host — values never left it. "
+                     "<strong>Advisory only</strong> — verify before trusting; candidates are never "
+                     "suppressed based on this.</div>")
+        if ai_rows:
+            parts.append("<table><thead><tr><th>Verdict</th><th>Value</th><th>Service</th>"
+                         "<th>Sensitivity</th><th>Reasoning</th></tr></thead><tbody>")
+            for a in ai_rows:
+                v = a.get("verdict", "unclear")
+                bcls = "error" if v == "real_secret" else ("warning" if v in ("unclear", "public_or_test_token") else "neutral")
+                parts.append(
+                    f"<tr><td><span class='badge {bcls}'>{html_escape(v.replace('_',' '))}</span></td>"
+                    f"<td><code>{html_escape(str(a.get('value',''))[:80])}</code></td>"
+                    f"<td>{html_escape(str(a.get('service','')))}</td>"
+                    f"<td>{html_escape(str(a.get('sensitivity','') or ''))}</td>"
+                    f"<td>{html_escape(str(a.get('reasoning','')))}</td></tr>")
+            parts.append("</tbody></table>")
         parts.append(end_section())
 
     # ── Summary ──────────────────────────────────────────────────────
@@ -9514,6 +9718,11 @@ def main():
     advanced.add_argument("--mutate-routes", action="store_true", default=False,
                           help="Stage 5f: probe sibling/unreferenced routes guessed from "
                                "discovered endpoints (extra requests — opt-in, URL mode)")
+    advanced.add_argument("--ai-secrets", action="store_true", default=False,
+                          help="Stage 8b: have a LOCAL Ollama model judge the secret/token "
+                               "candidates (real vs false-positive; nothing leaves the host)")
+    advanced.add_argument("--ai-model", default=AI_MODEL_DEFAULT, metavar="MODEL",
+                          help=f"Ollama model for --ai-secrets (default: {AI_MODEL_DEFAULT})")
     # default=None so apply_profile() can detect "user didn't pass it" and
     # apply the profile's value; main() treats None as falsy (no Wayback skip).
     advanced.add_argument("--no-wayback", action="store_true", default=None,
@@ -10027,6 +10236,10 @@ def main():
     results["th_verified"] = args.verify_secrets
     if th_file:
         results["th_candidates"] = count_nonempty_lines(th_file)
+
+    # Stage 8b — AI secret analysis (opt-in, local Ollama)
+    if args.ai_secrets:
+        results.update(ai_analyze_secrets(output_dir, args.ai_model, target_label))
 
     # Stage 9 — Report
     generate_report(target_label, output_dir, results)

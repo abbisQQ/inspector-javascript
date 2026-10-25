@@ -9,6 +9,7 @@ or, if you have pytest:
     python3 -m pytest tests/
 """
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -403,6 +404,25 @@ class LineLookupTests(unittest.TestCase):
 
     def test_empty_content(self):
         self.assertEqual(ijs.make_line_lookup("")(0), 1)
+
+
+
+class AiSecretCollectorTests(unittest.TestCase):
+    def test_collects_secret_candidates_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / "secrets-extended.json").write_text(
+                json.dumps({"kind": "weak-placeholder", "match": "password", "file": "main.js"}) + "\n"
+                + json.dumps({"kind": "stripe-key", "match": "sk_live_abc123", "file": "app.js"}) + "\n")
+            (base / "comments.json").write_text(
+                json.dumps({"kind": "credential_mention", "text": "apiKey=XYZ", "file": "app.js"}) + "\n"
+                + json.dumps({"kind": "todo", "text": "not a secret", "file": "app.js"}) + "\n")
+            cands = ijs._ai_collect_secrets(base)
+            vals = {c["value"] for c in cands}
+            self.assertIn("password", vals)              # placeholder candidate collected
+            self.assertIn("sk_live_abc123", vals)        # regex secret collected
+            self.assertTrue(any("apiKey=XYZ" in v for v in vals))  # credential_mention collected
+            self.assertFalse(any("not a secret" in v for v in vals))  # plain todo excluded
 
 
 if __name__ == "__main__":
