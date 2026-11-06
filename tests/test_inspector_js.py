@@ -461,10 +461,21 @@ class OriginClassifierTests(unittest.TestCase):
             self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg)[0],
                              "nonprod_host", host)
 
+    def test_glued_env_api_hosts(self):
+        # Real-world forms where the env marker is glued to "api" (seen on
+        # www.pamestoixima.gr): uatapi / preapi / ciapi must all be caught.
+        for host in ("uatapi.pamestoixima.gr", "preapi.pamestoixima.gr",
+                     "ciapi.pamestoixima.gr", "stgapi.pamestoixima.gr"):
+            self.assertEqual(ijs._classify_origin_host(host, self.th, self.reg)[0],
+                             "nonprod_host", host)
+
     def test_noise_excluded(self):
-        # prod host, CDN, and third-party dev hosts are NOT flagged by this stage
-        for host in ("www.pamestoixima.gr", "cdn.jsdelivr.net",
-                     "dev.visualwebsiteoptimizer.com", "staging.someother.com"):
+        # prod host, CDN, and third-party dev hosts are NOT flagged by this stage;
+        # prod "api" and look-alikes ("napi", "graphapi") must not false-positive
+        for host in ("www.pamestoixima.gr", "api.pamestoixima.gr",
+                     "napi.pamestoixima.gr", "graphapi.pamestoixima.gr",
+                     "cdn.jsdelivr.net", "dev.visualwebsiteoptimizer.com",
+                     "staging.someother.com"):
             self.assertIsNone(ijs._classify_origin_host(host, self.th, self.reg), host)
 
 
