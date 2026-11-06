@@ -3243,12 +3243,16 @@ _MULTI_PART_SUFFIXES = {
     "co.in", "co.za", "com.mx", "com.ar", "co.kr", "com.sg", "com.hk", "gr.com",
 }
 
-# Non-production / internal subdomain markers (matched as a whole label or a
-# dash/underscore-delimited token, so "napi-em-dev" and "dev-api" both hit).
+# Non-production / internal subdomain markers. Matched at a label boundary, with
+# an optional role suffix (api/gw/svc/…) glued on — so "napi-em-dev", "dev-api"
+# AND the very common glued forms "uatapi", "preapi", "ciapi", "stgapi" all hit,
+# while prod "api", "napi", "graphapi", "preview", "cinema" do not.
 _NONPROD_RE = re.compile(
-    r"(?:^|[.\-_])(?:dev|develop|development|staging|stage|stg|qa|uat|test|testing"
-    r"|preprod|preproduction|sandbox|sbx|demo|beta|internal|intranet|admin|mgmt"
-    r"|jenkins|gitlab|grafana|kibana|vpn|edge)(?:[.\-_]|$)", re.IGNORECASE)
+    r"(?:^|[.\-_])"
+    r"(?:dev|develop(?:ment)?|stag(?:e|ing)|stg|qa|uat|test(?:ing)?"
+    r"|pre(?:prod|production)?|sandbox|sbx|demo|beta|internal|intranet|admin|mgmt"
+    r"|jenkins|gitlab|grafana|kibana|vpn|edge|ci|cd|perf)"
+    r"(?:api|apigw|gw|svc|be|env|host|admin)?(?:[.\-_]|$)", re.IGNORECASE)
 
 
 def _registrable_domain(host: str) -> str:
@@ -8003,10 +8007,18 @@ def generate_report(target, output_dir, results):
     # ── Retire.js ────────────────────────────────────────────────────
     retire_file = results.get("retire_file")
     retire_libs = {}
+    retire_db_error = ""   # set when retire couldn't load its vuln DB (results unreliable)
     if retire_file:
         try:
             data    = json.loads(Path(retire_file).read_text(encoding="utf-8", errors="replace"))
             entries = data.get("data",[]) if isinstance(data,dict) else data
+            if isinstance(data, dict):
+                for e in (data.get("errors") or []):
+                    es = str(e)
+                    if any(k in es.lower() for k in ("jsrepository", "could not", "invalid url")) \
+                            or "403" in es or "404" in es:
+                        retire_db_error = es[:200]
+                        break
             for entry in entries:
                 fpath = entry.get("file","?")   # full analysed path (js-clean/ or bundles/)
                 for r in entry.get("results",[]):
@@ -8022,11 +8034,17 @@ def generate_report(target, output_dir, results):
             Log.debug(f"could not parse Retire.js output for report: {e}")
 
     vuln_libs = {k:v for k,v in retire_libs.items() if v["vulns"]}
-    ret_badge = "error" if vuln_libs else "neutral"
+    ret_badge = "error" if (vuln_libs or retire_db_error) else "neutral"
+    ret_summary = ("could not run" if (retire_db_error and not retire_libs)
+                   else f"{len(retire_libs)} detected, {len(vuln_libs)} vulnerable")
     parts.append(section("retire", "Libraries — Retire.js",
-                         f"{len(retire_libs)} detected, {len(vuln_libs)} vulnerable",
-                         ret_badge, open_=bool(vuln_libs)))
-    if not retire_libs:
+                         ret_summary, ret_badge, open_=bool(vuln_libs or retire_db_error)))
+    if retire_db_error and not retire_libs:
+        parts.append("<div class='notice err'>⚠ Retire.js could not load its vulnerability "
+                     "database — <strong>this section is unreliable</strong> and known-vulnerable "
+                     "libraries may be present but undetected. Re-run once the DB is reachable "
+                     f"(or pass a local <code>--jsrepo</code>).<br><code>{html_escape(retire_db_error)}</code></div>")
+    elif not retire_libs:
         parts.append("<div class='notice warn'>⚠ 0 libraries detected. Webpack-bundled apps strip the "
                      "version strings Retire.js fingerprints against — review js-clean/ manually "
                      "for inline library code.</div>")
